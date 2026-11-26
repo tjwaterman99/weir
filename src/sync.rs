@@ -2,7 +2,7 @@
 //! then clone, fetch, move or repair mirrors until the disk matches.
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use crate::db::{self, ProviderRow, RepoRow, TrackedRow};
 use crate::git::{self, Action, Job};
-use crate::provider::{self, AuthError, RemoteRepo};
+use crate::provider::{self, AuthError, Lookup, RemoteRepo};
 use crate::secret::Source;
+use crate::stray;
 use crate::target;
 use crate::util;
 
@@ -119,7 +120,7 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
     }
 
     let pushed: HashMap<i64, (Option<String>, String, String, String)> =
-        db::repos(conn, "state = 'active'", &[])?
+        db::repos(conn, "state IN ('active', 'archived')", &[])?
             .into_iter()
             .map(|r| (r.id, (r.pushed_at, r.default_branch, r.owner, r.name)))
             .collect();
@@ -274,6 +275,10 @@ pub fn summarize(counts: &BTreeMap<String, usize>) -> String {
         "updated",
         "healed",
         "moved",
+        "archived",
+        "recreated",
+        "transferred",
+        "inaccessible",
         "gone",
         "excluded",
         "skipped",
@@ -332,7 +337,7 @@ fn finish(
     }
 }
 
-fn lock() -> Result<File> {
+pub fn lock() -> Result<File> {
     let path = db::home().join("sync.lock");
     let file = File::options()
         .create(true)
@@ -386,11 +391,26 @@ fn matches_any(patterns: &[String], name: &str) -> bool {
     })
 }
 
-fn wanted(t: &TrackedRow, r: &RemoteRepo) -> bool {
-    (t.forks || !r.fork)
-        && (t.archived || !r.archived)
+/// Why a listed repository is or is not mirrored.
+#[derive(PartialEq)]
+enum Verdict {
+    Wanted,
+    /// Only the archived flag keeps it out.
+    ArchivedOnly,
+    Filtered,
+}
+
+fn verdict(t: &TrackedRow, r: &RemoteRepo) -> Verdict {
+    let by_name = (t.forks || !r.fork)
         && (t.include.is_empty() || matches_any(&t.include, &r.name))
-        && !matches_any(&t.exclude, &r.name)
+        && !matches_any(&t.exclude, &r.name);
+    if !by_name {
+        Verdict::Filtered
+    } else if r.archived && !t.archived {
+        Verdict::ArchivedOnly
+    } else {
+        Verdict::Wanted
+    }
 }
 
 pub fn mirror_path(root: &Path, host: &str, owner: &str, name: &str) -> PathBuf {
@@ -401,6 +421,17 @@ struct Credentials {
     token: String,
     login: String,
     name: String,
+}
+
+fn event(action: &str, repo: String, repo_id: i64, message: &str) -> Event {
+    Event {
+        action: action.to_string(),
+        repo,
+        repo_id: Some(repo_id),
+        old_head: None,
+        new_head: None,
+        message: Some(message.to_string()),
+    }
 }
 
 fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
@@ -432,7 +463,11 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
     // account is reported once and its other owners are skipped quietly.
     let mut creds: HashMap<i64, Option<Credentials>> = HashMap::new();
     let mut reachable: HashMap<i64, bool> = HashMap::new();
-    let mut listed: Vec<(i64, Option<String>)> = Vec::new();
+    let mut listed: Vec<(i64, Option<i64>)> = Vec::new();
+    // Repositories that dropped out of a listing. What happened to them is
+    // decided after every owner has been listed, because a repository that
+    // moved to another tracked owner is not missing at all.
+    let mut dropped: Vec<(RepoRow, i64, Option<i64>)> = Vec::new();
 
     for t in &tracked {
         let p = &providers[&t.provider_id];
@@ -513,9 +548,10 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
             }
         };
 
-        // The listing succeeded, so it is safe to conclude what is gone.
+        // The listing succeeded, so it is safe to conclude what changed.
         let mut seen: HashSet<i64> = HashSet::new();
         let mut excluded: HashSet<String> = HashSet::new();
+        let listed_ids: HashSet<&str> = remote.iter().map(|r| r.id.as_str()).collect();
         for r in &remote {
             if !valid_segment(&r.owner) || !valid_segment(&r.name) {
                 plan.problems.push(format!(
@@ -524,54 +560,148 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
                 ));
                 continue;
             }
-            if !wanted(t, r) {
-                excluded.insert(r.id.clone());
-                continue;
+            let full = format!("{}/{}/{}", p.host, r.owner, r.name);
+            let state = match verdict(t, r) {
+                Verdict::Wanted => "active",
+                Verdict::Filtered => {
+                    excluded.insert(r.id.clone());
+                    continue;
+                }
+                Verdict::ArchivedOnly => {
+                    // An archived repository never changes again, so a mirror
+                    // that already exists is kept and stays searchable. One
+                    // that was never mirrored is not cloned.
+                    let mirrored =
+                        db::repos(conn, "provider_id = ?1 AND remote_id = ?2", &[&p.id, &r.id])?
+                            .pop()
+                            .is_some_and(|row| row.disk_name.is_some());
+                    let on_disk = mirror_path(root, &p.host, &r.owner, &r.name)
+                        .join(".git")
+                        .is_dir();
+                    if !mirrored && !on_disk {
+                        excluded.insert(r.id.clone());
+                        continue;
+                    }
+                    "archived"
+                }
+            };
+            let up = upsert(conn, p.id, t.id, r, state, &listed_ids)?;
+            seen.insert(up.id);
+            if up.newly_archived {
+                plan.events.push(event(
+                    "archived",
+                    full.clone(),
+                    up.id,
+                    "archived on the provider; mirror kept",
+                ));
             }
-            seen.insert(upsert(conn, p.id, t.id, r)?);
+            if up.recreated {
+                plan.events.push(event(
+                    "recreated",
+                    full,
+                    up.id,
+                    "deleted and created again on the provider; the mirror follows the new one",
+                ));
+            }
         }
-        for old in db::repos(conn, "tracked_id = ?1 AND state = 'active'", &[&t.id])? {
+        for old in db::repos(
+            conn,
+            "tracked_id = ?1 AND state IN ('active', 'archived')",
+            &[&t.id],
+        )? {
             if seen.contains(&old.id) {
                 continue;
             }
-            let state = if excluded.contains(&old.remote_id) {
-                "excluded"
+            if excluded.contains(&old.remote_id) {
+                conn.execute(
+                    "UPDATE repos SET state = 'excluded' WHERE id = ?1",
+                    [old.id],
+                )?;
+                if scope.matches_repo(&old) {
+                    plan.events.push(event(
+                        "excluded",
+                        format!("{}/{}/{}", p.host, old.owner, old.name),
+                        old.id,
+                        "now filtered out; mirror kept",
+                    ));
+                }
             } else {
-                "gone"
-            };
-            conn.execute(
-                "UPDATE repos SET state = ?1 WHERE id = ?2",
-                params![state, old.id],
-            )?;
-            if scope.matches_repo(&old) {
-                plan.events.push(Event {
-                    action: state.to_string(),
-                    repo: format!("{}/{}/{}", p.host, old.owner, old.name),
-                    repo_id: Some(old.id),
-                    old_head: None,
-                    new_head: None,
-                    message: Some(
-                        if state == "gone" {
-                            "no longer on the provider; mirror kept"
-                        } else {
-                            "now filtered out; mirror kept"
-                        }
-                        .to_string(),
-                    ),
-                });
+                dropped.push((old, t.id, account_id));
             }
         }
-        listed.push((t.id, cred.map(|c| c.name.clone())));
+        listed.push((t.id, account_id));
     }
 
-    for (tracked_id, account) in &listed {
-        for r in db::repos(conn, "tracked_id = ?1 AND state = 'active'", &[tracked_id])? {
+    for (old, tracked_id, account_id) in dropped {
+        // Picked up by another tracked owner in this run: it moved, it is not gone.
+        let current = db::repos(conn, "id = ?1", &[&old.id])?.pop();
+        if current.is_none_or(|row| row.tracked_id != Some(tracked_id)) {
+            continue;
+        }
+        let p = &providers[&old.provider_id];
+        let full = format!("{}/{}/{}", p.host, old.owner, old.name);
+        let token = account_id
+            .and_then(|id| creds.get(&id))
+            .and_then(|c| c.as_ref())
+            .map(|c| c.token.as_str());
+        let found = provider::build(p).and_then(|prov| prov.lookup_id(&old.remote_id, token));
+        let (state, message) = match found {
+            Ok(Lookup::NotFound) => ("gone", "no longer on the provider; mirror kept".to_string()),
+            Ok(Lookup::Forbidden) => (
+                "inaccessible",
+                "still exists, but access is refused; mirror kept".to_string(),
+            ),
+            Ok(Lookup::Found(now)) if !now.owner.eq_ignore_ascii_case(&old.owner) => (
+                "transferred",
+                format!(
+                    "now {}/{}, which is not tracked; mirror kept",
+                    now.owner, now.name
+                ),
+            ),
+            Ok(Lookup::Found(_)) => (
+                "inaccessible",
+                "still exists, but is no longer listed for this account; mirror kept".to_string(),
+            ),
+            Err(e) => {
+                // Not knowing is not a reason to change anything.
+                plan.problems.push(format!(
+                    "{full}: left the listing and could not be checked: {e:#}"
+                ));
+                continue;
+            }
+        };
+        conn.execute(
+            "UPDATE repos SET state = ?1 WHERE id = ?2",
+            params![state, old.id],
+        )?;
+        if scope.matches_repo(&old) {
+            plan.events.push(event(state, full, old.id, &message));
+        }
+    }
+
+    // Unmanaged clones are only looked at when something is about to be
+    // cloned, to see whether one of them is that repository under an old name.
+    let mut strays: Option<Vec<stray::Stray>> = None;
+    let mut stray_ids: HashMap<PathBuf, Option<String>> = HashMap::new();
+
+    for (tracked_id, account_id) in &listed {
+        let cred = account_id
+            .and_then(|id| creds.get(&id))
+            .and_then(|c| c.as_ref());
+        let token = cred.map(|c| c.token.as_str());
+        for r in db::repos(
+            conn,
+            "tracked_id = ?1 AND state IN ('active', 'archived')",
+            &[tracked_id],
+        )? {
             if !scope.matches_repo(&r) {
                 continue;
             }
-            let host = &providers[&r.provider_id].host;
+            let p = &providers[&r.provider_id];
+            let host = &p.host;
             let path = mirror_path(root, host, &r.owner, &r.name);
-            let move_from = match (&r.disk_owner, &r.disk_name) {
+            let synced_before = r.disk_name.is_some();
+            let mut move_from = match (&r.disk_owner, &r.disk_name) {
                 (Some(o), Some(n))
                     if !(o.eq_ignore_ascii_case(&r.owner) && n.eq_ignore_ascii_case(&r.name)) =>
                 {
@@ -579,9 +709,36 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
                 }
                 _ => None,
             };
-            let known = r.last_result.as_deref() == Some("ok") && r.disk_name.is_some();
+            let mut accept_origin = false;
+            if !synced_before && path.join(".git").is_dir() {
+                // A clone that predates weir may still point at an old name of
+                // this repository. The provider knows whether it is the same one.
+                accept_origin = old_name_of(p, &path, &r, token).unwrap_or(false);
+            } else if !synced_before && !path.exists() {
+                if strays.is_none() {
+                    strays = Some(stray::scan(conn, root)?);
+                }
+                for s in strays.iter().flatten().filter(|s| {
+                    s.provider_id == r.provider_id && s.owner.eq_ignore_ascii_case(&r.owner)
+                }) {
+                    let id = stray_ids.entry(s.path.clone()).or_insert_with(|| {
+                        let origin =
+                            git::opt(Some(&s.path), &["config", "--get", "remote.origin.url"])?;
+                        let (owner, name) = stray::origin_owner_name(p, &origin)?;
+                        match provider::build(p).ok()?.lookup(&owner, &name, token) {
+                            Ok(Lookup::Found(found)) => Some(found.id),
+                            _ => None,
+                        }
+                    });
+                    if id.as_deref() == Some(r.remote_id.as_str()) {
+                        move_from = Some(s.path.clone());
+                        break;
+                    }
+                }
+            }
+            let settled = r.last_result.as_deref() == Some("ok") && synced_before;
             let fetch = o.all
-                || !known
+                || !settled
                 || !path.exists()
                 || r.pushed_at.is_none()
                 || r.pushed_at != r.synced_pushed_at
@@ -596,14 +753,28 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
                 path,
                 clone_url: r.clone_url.clone(),
                 default_branch: r.default_branch.clone(),
-                account: account.clone(),
+                account: cred.map(|c| c.name.clone()),
                 fetch,
-                known: r.disk_name.is_some(),
+                known: synced_before,
                 move_from,
+                accept_origin,
             });
         }
     }
     Ok(plan)
+}
+
+/// Whether the clone at `path` points at an old name of repository `r`.
+fn old_name_of(p: &ProviderRow, path: &Path, r: &RepoRow, token: Option<&str>) -> Option<bool> {
+    let origin = git::opt(Some(path), &["config", "--get", "remote.origin.url"])?;
+    if git::normalize_url(&origin) == git::normalize_url(&r.clone_url) {
+        return Some(false);
+    }
+    let (owner, name) = stray::origin_owner_name(p, &origin)?;
+    match provider::build(p).ok()?.lookup(&owner, &name, token) {
+        Ok(Lookup::Found(found)) => Some(found.id == r.remote_id),
+        _ => Some(false),
+    }
 }
 
 /// A cheap check that a mirror's HEAD is still detached where weir left it,
@@ -619,25 +790,53 @@ fn head_in_place(path: &Path, expected: Option<&str>) -> bool {
     }
 }
 
-/// Inserts or updates the row for a listed repository and returns its id.
-fn upsert(conn: &Connection, provider_id: i64, tracked_id: i64, r: &RemoteRepo) -> Result<i64> {
+struct Upserted {
+    id: i64,
+    /// It was active before and the provider now reports it archived.
+    newly_archived: bool,
+    /// A new repository took over the name, and the row, of one that is gone.
+    recreated: bool,
+}
+
+/// Inserts or updates the row for a listed repository.
+fn upsert(
+    conn: &Connection,
+    provider_id: i64,
+    tracked_id: i64,
+    r: &RemoteRepo,
+    state: &str,
+    listed: &HashSet<&str>,
+) -> Result<Upserted> {
+    let before: Option<String> = conn
+        .query_row(
+            "SELECT state FROM repos WHERE provider_id = ?1 AND remote_id = ?2",
+            params![provider_id, r.id],
+            |row| row.get(0),
+        )
+        .optional()?;
     // A repository deleted and recreated under the same name gets a new id on
-    // the provider. Drop the old row so one mirror never has two owners.
-    conn.execute(
-        "DELETE FROM repos
-         WHERE provider_id = ?1 AND owner = ?2 AND name = ?3 AND remote_id <> ?4
-           AND state <> 'active'",
-        params![provider_id, r.owner, r.name, r.id],
-    )?;
+    // the provider. Drop the row of the one it replaced, so one mirror never
+    // has two owners. A row whose repository is still in this listing is left
+    // alone: that is two repositories trading names, not a replacement.
+    let mut replaced = 0;
+    for other in db::repos(
+        conn,
+        "provider_id = ?1 AND owner = ?2 AND name = ?3 AND remote_id <> ?4",
+        &[&provider_id, &r.owner, &r.name, &r.id],
+    )? {
+        if !listed.contains(other.remote_id.as_str()) {
+            replaced += conn.execute("DELETE FROM repos WHERE id = ?1", [other.id])?;
+        }
+    }
     conn.execute(
         "INSERT INTO repos (provider_id, tracked_id, remote_id, owner, name, default_branch,
                             clone_url, pushed_at, fork, archived, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active')
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT (provider_id, remote_id) DO UPDATE SET
            tracked_id = excluded.tracked_id, owner = excluded.owner, name = excluded.name,
            default_branch = excluded.default_branch, clone_url = excluded.clone_url,
            pushed_at = excluded.pushed_at, fork = excluded.fork, archived = excluded.archived,
-           state = 'active'",
+           state = excluded.state",
         params![
             provider_id,
             tracked_id,
@@ -648,14 +847,20 @@ fn upsert(conn: &Connection, provider_id: i64, tracked_id: i64, r: &RemoteRepo) 
             r.clone_url,
             r.pushed_at,
             r.fork,
-            r.archived
+            r.archived,
+            state
         ],
     )?;
-    Ok(conn.query_row(
+    let id = conn.query_row(
         "SELECT id FROM repos WHERE provider_id = ?1 AND remote_id = ?2",
         params![provider_id, r.id],
         |row| row.get(0),
-    )?)
+    )?;
+    Ok(Upserted {
+        id,
+        newly_archived: before.as_deref() == Some("active") && state == "archived",
+        recreated: replaced > 0 && before.is_none(),
+    })
 }
 
 /// Used by `status` and `list`: the mirror's location for a repository row.

@@ -178,6 +178,10 @@ recorded last time, and then acts on each repository:
 | `adopted` | A clone that was already at the mirror's path was taken over (first sync only). |
 | `healed` | HEAD had been moved, for example by `git checkout -b`; it was put back. The branch is kept. |
 | `moved` | The repository was renamed upstream; the mirror's directory was renamed to match, without cloning again. |
+| `archived` | The repository was archived upstream. The mirror is kept and stays searchable. |
+| `recreated` | The repository was deleted and created again upstream. The mirror follows the new one. |
+| `transferred` | The repository moved to an owner you do not track. The mirror stays on disk. |
+| `inaccessible` | The repository still exists, but this account can no longer read it. The mirror stays on disk. |
 | `gone` | The repository no longer exists upstream. The mirror stays on disk. |
 | `excluded` | Your filters no longer include it. The mirror stays on disk. |
 | `skipped` | The mirror has modified files. It was left exactly as it is. |
@@ -187,8 +191,9 @@ Three promises hold whatever happens:
 
 - **weir never discards work.** It does not reset, clean or stash. A mirror with modified files is
   skipped and reported until you deal with it.
-- **Only `weir prune` deletes mirrors.** It deletes mirrors that are gone, excluded or untracked,
-  asks first, and refuses any mirror that has worktrees, local commits, stashes or stray files.
+- **Only `weir prune` deletes mirrors.** It deletes mirrors that are gone, excluded, transferred or
+  untracked, asks first, and refuses any mirror that has worktrees, local commits, stashes or stray
+  files. It never deletes a mirror of a repository you merely lost access to.
 - **A provider outage changes nothing.** If the list of repositories cannot be fetched, weir
   reports it and leaves every mirror as it was. A rejected token is reported once per account.
 
@@ -196,11 +201,50 @@ Three promises hold whatever happens:
 attention, and `2` when it could not run. `weir sync --dry-run` shows what would happen and
 changes nothing.
 
+### When a repository changes upstream
+
+| Upstream change | What weir does |
+|---|---|
+| Renamed | Renames the mirror's directory to match. No new clone. |
+| Transferred to another owner | If you track the new owner, the mirror moves there. If not, it is marked `transferred` and kept. |
+| Archived | Syncs it one last time, marks it `archived` and keeps it. It no longer shows in `weir list` (use `--archived`), `weir path` still finds it, and `weir prune` leaves it alone unless you pass `--archived`. An archived repository that was never mirrored is not cloned unless the owner is tracked with `--archived`. |
+| Unarchived | It becomes an ordinary mirror again. |
+| Deleted | Marked `gone` and kept until you run `weir prune`. |
+| Access lost | Marked `inaccessible` and kept. `weir prune` never deletes it. If access comes back, so does the mirror. |
+| Deleted and created again under the same name | The mirror follows the new repository, and the sync says `recreated`. |
+| Default branch changed, or force-pushed | The mirror moves to the new tip of the new default branch. |
+
+One caveat about "access lost": GitHub answers "not found" for a private repository that your
+token can no longer see, exactly as it does for a deleted one. weir can only report those as
+`gone`. That is one reason `prune` always asks before deleting.
+
+### Clones weir does not manage
+
+A directory under the root that weir does not know about is never synced, so it goes stale without
+anyone noticing. `weir status` counts them, and `weir doctor` explains each one:
+
+```
+$ weir doctor
+3 git repositories under /Users/me/Repos are not managed by weir. They are never synced.
+
+duplicate     /Users/me/Repos/github.com/acme/api-old
+              a stale copy of github.com/acme/api, whose mirror is /Users/me/Repos/github.com/acme/api
+gone          /Users/me/Repos/github.com/acme/prototype
+              not found on the provider (deleted, or no longer visible); this may be the only copy
+untracked     /Users/me/Repos/github.com/someone/tool
+              is github.com/someone/tool, which is not tracked
+```
+
+`weir prune --unmanaged` deletes the stale copies (`duplicate`) that have nothing to lose. It
+leaves every other kind alone, because some of them are the only copy of that code.
+
 ### Existing clones
 
 If you already have clones laid out as `<root>/<host>/<owner>/<name>`, the first sync adopts them
 in place instead of cloning again. A local default branch with commits that were never pushed is
-kept and reported, and so are stashes.
+kept and reported, and so are stashes. A clone that still points at an old name of a repository,
+or sits in a directory with the old name, is recognized by asking the provider, then corrected or
+moved into place.
 
 ## Running it on a schedule
 
@@ -226,10 +270,11 @@ weir track <host>/<owner>[/<repo>] [--account NAME] [--include GLOB] [--exclude 
 weir untrack <host>/<owner>[/<repo>]
 
 weir sync [<target>] [--dry-run] [--all] [--jobs N] [--network-wait SECONDS]
-weir prune [--dry-run] [--yes]
+weir prune [--dry-run] [--yes] [--archived] [--unmanaged]
 
 weir status [<target>]
-weir list [<target>] [--all]
+weir doctor
+weir list [<target>] [--archived] [--all]
 weir path <repo>
 weir log [-n COUNT]
 

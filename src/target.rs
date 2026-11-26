@@ -97,7 +97,9 @@ pub fn resolve(conn: &Connection, target: Option<&str>) -> Result<Scope> {
             )?;
             let named = db::repos(conn, "name = ?1", &[&word])?;
             match (is_owner, named.len()) {
-                (true, 0) => Ok(Scope {
+                // An owner wins over a repository of the same name, which is
+                // common: a profile repository is named after its owner.
+                (true, _) => Ok(Scope {
                     owner: Some(word.to_string()),
                     ..Scope::default()
                 }),
@@ -130,13 +132,13 @@ pub fn one_repo(conn: &Connection, target: &str) -> Result<RepoRow> {
             )?
         }
     };
-    // Prefer repositories that are still tracked over ones that are gone.
-    let active: Vec<&RepoRow> = found.iter().filter(|r| r.state == "active").collect();
-    let pick: Vec<&RepoRow> = if active.is_empty() {
-        found.iter().collect()
-    } else {
-        active
-    };
+    // Prefer live mirrors, then archived ones, over repositories that are gone.
+    let in_state =
+        |state: &str| -> Vec<&RepoRow> { found.iter().filter(|r| r.state == state).collect() };
+    let pick: Vec<&RepoRow> = [in_state("active"), in_state("archived")]
+        .into_iter()
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| found.iter().collect());
     match pick.len() {
         0 => bail!("no repository named {target:?} is known; see `weir list`"),
         1 => Ok(pick[0].clone()),
