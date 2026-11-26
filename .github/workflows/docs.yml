@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -19,11 +17,8 @@ env:
   MDBOOK_VERSION: "0.4.40"
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
       - name: Install mdBook
@@ -32,9 +27,21 @@ jobs:
             | tar -xz -C /usr/local/bin
       - run: mdbook build docs
       - run: python3 docs/check-links.py docs/book
-      - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
           path: docs/book
+
+  # A separate job: the deploy action only sees the artifact once the job
+  # that uploaded it has finished.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
         uses: actions/deploy-pages@v5
