@@ -55,7 +55,18 @@ Because it is a real clone, `git log`, `git blame` and `git grep` all work in it
 
 ## Install
 
-weir needs `git` and a Rust toolchain (1.89 or newer). It runs on macOS and Linux.
+With [Homebrew](https://brew.sh), on macOS or Linux:
+
+```
+brew install tjwaterman99/tap/weir
+```
+
+That installs a prebuilt binary; `brew upgrade` picks up new releases. weir needs `git` on your
+`PATH`, which macOS and most Linux systems already have.
+
+Without Homebrew, download the archive for your platform from the
+[releases page](https://github.com/tjwaterman99/weir/releases), unpack it and put `weir` in a
+directory on your `PATH`. Or build it from source, which needs a Rust toolchain (1.89 or newer):
 
 ```
 git clone https://github.com/tjwaterman99/weir
@@ -63,8 +74,8 @@ cd weir
 cargo install --path .
 ```
 
-That puts `weir` in `~/.cargo/bin`. Keep that directory on your `PATH`: git calls `weir` by name
-when a mirror needs a token.
+However you install it, keep `weir` on your `PATH`: git calls it by name when a mirror needs a
+token. `weir version` prints the version and the commit it was built from.
 
 ## Quick start
 
@@ -338,7 +349,7 @@ up to a minute for the network.
 
 ```
 # cron: every morning at 08:30
-30 8 * * *  $HOME/.cargo/bin/weir sync --quiet
+30 8 * * *  /opt/homebrew/bin/weir sync --quiet
 ```
 
 You can also run `weir daemon` under any process supervisor of your own.
@@ -431,6 +442,11 @@ same owners again and the next sync adopts what is on disk.
   Keychain ties access to the exact program that stored the token.
 
 ## Development
+
+Releases: bump `version` in `Cargo.toml`, merge, then push a tag `vX.Y.Z`. The release workflow
+tests and builds for macOS and Linux (Apple silicon, Intel and ARM), publishes a GitHub release and
+updates the Homebrew tap. A tag with a suffix, such as `v1.2.0-rc.1`, publishes a pre-release and
+leaves the tap alone.
 
 ```
 cargo test                                               # unit tests and end-to-end tests

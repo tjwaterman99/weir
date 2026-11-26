@@ -28,6 +28,14 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 Run all three before pushing; CI runs the same on Linux only, so macOS is covered by running
 them locally.
 
+## Releasing
+
+`.github/workflows/release.yml` runs on a `vX.Y.Z` tag: it checks the tag against `Cargo.toml`,
+tests, builds four targets, publishes a GitHub release, and writes `Formula/weir.rb` to
+`tjwaterman99/homebrew-tap` with `packaging/formula.sh` (pushed with the `TAP_DEPLOY_KEY` secret, a
+deploy key that can only write to the tap). Rehearse with a `-rc.N` tag: it publishes a pre-release
+and skips the tap. PR CI runs on Linux only; macOS is exercised by the release workflow.
+
 ## Rules
 
 - **weir never discards work.** No `reset`, `clean`, `stash` or forced checkout on a mirror. A

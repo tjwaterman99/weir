@@ -1,0 +1,96 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds the binaries, publishes a GitHub release and
+# updates the Homebrew tap. A tag with a suffix (vX.Y.Z-rc.1) publishes a
+# pre-release and leaves the tap alone, which is how to rehearse a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14, test: true }
+          - { target: x86_64-apple-darwin, os: macos-14, test: false }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, test: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, test: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches Cargo.toml
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          case "$GITHUB_REF_NAME" in
+            "v$version" | "v$version"-*) ;;
+            *)
+              echo "tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+              exit 1
+              ;;
+          esac
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build
+        run: WEIR_BUILD_COMMIT="${GITHUB_SHA::9}" cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="weir-$VERSION-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/weir" README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            weir-*.tar.gz
+            weir-*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --title "$GITHUB_REF_NAME" --generate-notes $flags
+      - name: Write the Homebrew formula
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: packaging/formula.sh "${GITHUB_REF_NAME#v}" dist > weir.rb
+      - name: Check out the tap
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: actions/checkout@v4
+        with:
+          repository: tjwaterman99/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Update the tap
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          mkdir -p tap/Formula
+          mv weir.rb tap/Formula/weir.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/weir.rb
+          git commit -m "weir ${GITHUB_REF_NAME#v}"
+          git push
