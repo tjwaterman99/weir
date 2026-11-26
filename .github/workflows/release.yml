@@ -16,13 +16,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-14, test: true }
-          - { target: x86_64-apple-darwin, os: macos-14, test: false }
+          - { target: aarch64-apple-darwin, os: macos-latest, test: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, test: false }
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, test: true }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, test: true }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check that the tag matches Cargo.toml
         run: |
           version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
@@ -49,7 +49,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/weir" README.md "$name/"
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -60,8 +60,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -78,7 +78,7 @@ jobs:
         run: packaging/formula.sh "${GITHUB_REF_NAME#v}" dist > weir.rb
       - name: Check out the tap
         if: ${{ !contains(github.ref_name, '-') }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: tjwaterman99/homebrew-tap
           ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
