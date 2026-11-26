@@ -1668,3 +1668,41 @@ fn unchanged_listings_cost_nothing_and_the_rate_limit_is_respected() {
     );
     assert!(env.p("root").join("ghe.test/beta/b").exists());
 }
+
+/// The documentation's command reference is generated from the command-line
+/// definitions. This fails when the committed pages are out of date.
+#[test]
+fn command_reference_is_up_to_date() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let committed = repo.join("docs/src/reference/commands");
+    let env = Env::new();
+    let fresh = env.p("reference");
+    env.ok(&[
+        "reference",
+        fresh.to_str().unwrap(),
+        "--examples",
+        repo.join("docs/src/examples").to_str().unwrap(),
+    ]);
+    let names = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let hint = "regenerate with: cargo run -- reference docs/src/reference/commands --examples docs/src/examples";
+    assert_eq!(names(&fresh), names(&committed), "{hint}");
+    let summary = std::fs::read_to_string(repo.join("docs/src/SUMMARY.md")).unwrap();
+    for name in names(&fresh) {
+        assert_eq!(
+            std::fs::read_to_string(fresh.join(&name)).unwrap(),
+            std::fs::read_to_string(committed.join(&name)).unwrap(),
+            "docs/src/reference/commands/{name} is out of date; {hint}"
+        );
+        assert!(
+            summary.contains(&format!("reference/commands/{name}")),
+            "docs/src/SUMMARY.md does not list reference/commands/{name}"
+        );
+    }
+}

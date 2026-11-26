@@ -1,0 +1,11 @@
+$ weir status
+Mirrors in /Users/me/Repos
+
+Accounts
+  none; add one with `weir auth login <host>`
+
+Tracked
+  git.example.com/acme                     3 repos
+
+Last sync 2026-11-26T08:30:00Z (4m10s ago), took 2s: 1 updated, 2 unchanged
+Last 2 runs: 2 ok, 0 with problems

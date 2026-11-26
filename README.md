@@ -4,8 +4,8 @@ weir keeps a local, read-only copy of every repository you care about on GitHub,
 copies up to date.
 
 You tell it which organizations, users or single repositories to follow. It clones them into one
-directory tree, and each time it runs it brings every copy to the latest commit of its default
-branch. The copies are protected against accidental edits, so they always show what is upstream.
+directory tree and keeps every copy at the latest commit of its default branch. The copies are
+protected against accidental edits, so they always show what is upstream.
 
 ```
 $ weir auth login github.com
@@ -15,14 +15,18 @@ cloned    github.com/acme/api
 cloned    github.com/acme/web
 weir: 2 cloned in 4s
 
+$ weir service install        # from now on, mirrors stay a few minutes behind
+
 $ rg "retry_policy" ~/Repos/github.com/acme
 ```
 
+**Documentation: <https://tjwaterman99.github.io/weir/>**
+
 ## Why it exists
 
-**Local copies are much faster to search than a provider's API.** A coding agent (or a person)
-answering "where is this used?" across a few hundred repositories wants `rg` over files on disk:
-it takes milliseconds, has no rate limit, and sees every file. Searching through a web API is slow,
+**Local copies are much faster to search than a provider's API.** A coding agent, or a person,
+answering "where is this used?" across a few hundred repositories wants `rg` over files on disk.
+It takes milliseconds, has no rate limit, and sees every file. Searching through a web API is slow,
 limited and incomplete.
 
 Local copies only help if you can trust them, and a pile of clones goes wrong in three ways:
@@ -34,24 +38,10 @@ Local copies only help if you can trust them, and a pile of clones goes wrong in
 - **They need the right login.** With a work account and a personal account on the same host, every
   clone, fetch and push has to pick the right one. Getting it wrong shows up as a confusing 404.
 
-weir handles all three: it finds, clones and updates repositories on its own, it keeps the copies
-read-only and puts them back if they move, and it knows which account each repository belongs to.
+weir handles all three. It finds, clones and updates repositories on its own. It keeps the copies
+read-only and puts them back if they move. And it knows which account each repository belongs to.
 
 The name: a weir is a low dam across a river. Water only flows over it one way.
-
-## What a mirror looks like
-
-weir calls each local copy a mirror. It lives at `<root>/<host>/<owner>/<name>`, by default
-`~/Repos/github.com/acme/api`. A mirror is an ordinary git clone with three differences:
-
-- **It is not on a branch.** HEAD is detached at the latest commit of the remote's default branch
-  (`origin/main`, `origin/develop`, whatever the provider reports). There is no local `main` to
-  fall behind or diverge.
-- **Its files are read-only.** An editor or an agent that tries to save over a file is refused.
-- **It carries its own credentials.** The mirror's git config names the weir account to use, so
-  git commands run inside it sign in as the right user.
-
-Because it is a real clone, `git log`, `git blame` and `git grep` all work in it.
 
 ## Install
 
@@ -61,392 +51,96 @@ With [Homebrew](https://brew.sh), on macOS or Linux:
 brew install tjwaterman99/tap/weir
 ```
 
-That installs a prebuilt binary; `brew upgrade` picks up new releases. weir needs `git` on your
-`PATH`, which macOS and most Linux systems already have.
-
-Without Homebrew, download the archive for your platform from the
-[releases page](https://github.com/tjwaterman99/weir/releases), unpack it and put `weir` in a
-directory on your `PATH`. Or build it from source, which needs a Rust toolchain (1.89 or newer):
-
-```
-git clone https://github.com/tjwaterman99/weir
-cd weir
-cargo install --path .
-```
-
-However you install it, keep `weir` on your `PATH`: git calls it by name when a mirror needs a
-token. `weir version` prints the version and the commit it was built from.
+That installs a prebuilt binary. weir needs `git` on your `PATH`. The
+[install page](https://tjwaterman99.github.io/weir/install.html) covers release archives and
+building from source.
 
 ## Quick start
 
-1. **Add an account.** On macOS, weir asks for a token and stores it in the Keychain. On Linux,
-   use `--env` or `--command` (see [Where tokens are kept](#where-tokens-are-kept)).
+1. **Add an account.** On macOS, weir asks for a token and stores it in the Keychain.
 
    ```
    weir auth login github.com
    ```
 
-   If you already use the GitHub CLI, you can skip the token and let weir ask `gh` each time:
+   If you already use the GitHub CLI, let weir ask it each time. This also works on Linux:
 
    ```
    weir auth login github.com --command "gh auth token"
    ```
 
-   The token needs read access to the repositories you want mirrored (`repo` scope for a classic
-   token). It needs write access too if you will push from worktrees, described below.
-
 2. **Say what to mirror.** An organization, a user, or one repository.
 
    ```
    weir track github.com/acme
-   weir track github.com/torvalds/linux
    ```
 
-3. **Sync.**
+3. **Sync.** The first run clones everything. Later runs only contact repositories that changed.
 
    ```
    weir sync
    ```
 
-   The first run clones everything. Later runs only contact repositories that received a push
-   since the last run, so a sync of several hundred repositories usually takes seconds.
-
-4. **Keep it current.** Let weir run in the background from now on:
+4. **Keep it current.** Run weir in the background from now on.
 
    ```
    weir service install
    ```
 
-5. **Use the mirrors.**
+5. **Use the mirrors.** They live at `~/Repos/<host>/<owner>/<name>`.
 
    ```
-   weir list                 # what is mirrored
-   weir path api             # prints ~/Repos/github.com/acme/api
-   weir status               # accounts, what is tracked, the last sync, anything needing attention
+   weir list
+   weir path api        # prints ~/Repos/github.com/acme/api
+   weir status
    ```
 
-## Making changes to a repository
+## What you get
 
-A mirror is for reading. To change code, create a git worktree from the mirror. The worktree is
-a separate, writable checkout on its own branch, and it shares the mirror's history, so it costs
-almost no disk space or time:
-
-```
-cd "$(weir path api)"
-git worktree add -b fix-timeout ~/work/api-fix-timeout origin/main
-cd ~/work/api-fix-timeout
-# edit, commit, then:
-git push -u origin fix-timeout
-```
-
-The worktree also shares the mirror's git config, so the push signs in with the same account weir
-uses for that repository. The mirror itself never leaves the default branch.
-
-## Several accounts on one host
-
-Add each account under its own name, then say which account each owner goes through:
-
-```
-weir auth login github.com --name work
-weir auth login github.com --name personal
-
-weir track github.com/acme   --account work
-weir track github.com/myself --account personal
-```
-
-Every repository uses the account of the owner it was tracked under, for listing, cloning,
-fetching and pushing. `--account` is optional while a host has one account and required once it
-has two. `weir auth list` shows every account and checks that its token still works.
-
-### Where tokens are kept
-
-weir's database never contains a token. It records where to find one:
-
-| Option | The token comes from | Good for |
-|---|---|---|
-| (default) | the macOS Keychain; weir asks for it once at login | a Mac you work on |
-| `--env NAME` | the environment variable `NAME`, read each time | servers and CI |
-| `--command "..."` | the output of a command, run each time | reusing another tool's login, e.g. `gh auth token --user myself` |
-
-Tokens are never written into remote URLs or printed.
-
-## Choosing what to mirror
-
-```
-weir track github.com/acme                       # everything in the organization
-weir track github.com/acme --exclude "*-archive" # skip names matching a glob (repeatable)
-weir track github.com/acme --include "api-*"     # only names matching a glob (repeatable)
-weir track github.com/acme --forks --archived    # forks and archived repositories are skipped by default
-weir track github.com/acme --max-size 2000       # skip repositories larger than 2000 MB
-weir track github.com/acme/api                   # a single repository
-weir untrack github.com/acme                     # stop; the mirrors stay on disk
-```
-
-Running `track` again for the same owner replaces its settings.
-
-## What a sync does
-
-`weir sync` asks each provider for the current list of repositories, compares it with what it
-recorded last time, and then acts on each repository:
-
-| Output | Meaning |
-|---|---|
-| `cloned` | A new repository was cloned. |
-| `updated` | The mirror moved to a newer commit. |
-| `adopted` | A clone that was already at the mirror's path was taken over (first sync only). |
-| `healed` | HEAD had been moved, for example by `git checkout -b`; it was put back. The branch is kept. |
-| `moved` | The repository was renamed upstream; the mirror's directory was renamed to match, without cloning again. |
-| `archived` | The repository was archived upstream. The mirror is kept and stays searchable. |
-| `recreated` | The repository was deleted and created again upstream. The mirror follows the new one. |
-| `transferred` | The repository moved to an owner you do not track. The mirror stays on disk. |
-| `inaccessible` | The repository still exists, but this account can no longer read it. The mirror stays on disk. |
-| `gone` | The repository no longer exists upstream. The mirror stays on disk. |
-| `excluded` | Your filters no longer include it. The mirror stays on disk. |
-| `skipped` | The mirror has modified files. It was left exactly as it is. |
-| `failed` | Something went wrong for this repository; the reason is printed. |
-
-Three promises hold whatever happens:
-
-- **weir never discards work.** It does not reset, clean or stash. A mirror with modified files is
-  skipped and reported until you deal with it. (The one forced checkout weir ever does is to finish
-  its own, if it was killed half-way through one. It leaves itself a marker to know.)
-- **Only `weir prune` deletes mirrors.** It deletes mirrors that are gone, excluded, transferred or
-  untracked, asks first, and refuses any mirror that has worktrees, local commits, stashes or stray
-  files. It never deletes a mirror of a repository you merely lost access to.
-- **A provider outage changes nothing.** If the list of repositories cannot be fetched, weir
-  reports it and leaves every mirror as it was. A rejected token is reported once per account.
-
-`weir sync` exits with `0` when everything is in order, `1` when some repository or account needs
-attention, and `2` when it could not run. If another sync is running, it waits for it; `--no-wait`
-makes it fail instead. `weir sync --dry-run` shows what would happen and
-changes nothing.
-
-### Watching a sync
-
-In a terminal, `weir sync` keeps a status line at the bottom while it works: how many repositories
-are done, the counts so far, the time taken, and what it is working on right now. A large clone
-shows its size, so it does not look stuck.
-
-```
-updated   github.com/acme/api  638bb2c -> df75e0b
-[412/709] 3 cloned, 12 updated, 380 unchanged · 3m10s · monorepo (14.1 GB) 2m05s, web, +2
-```
-
-From any other terminal:
-
-```
-weir status       # says "Sync running: [412/709] ..." while one is in progress
-weir watch        # follows the running sync until it ends, with the same live line
-weir watch --follow   # keeps following the next ones too
-```
-
-That works for a sync started by a scheduler as well. Afterwards:
-
-```
-weir log          # past runs and what each changed
-weir log --slow   # the ten slowest repositories of each run
-weir log --all    # also the repositories that were fetched and had not changed
-```
-
-Every run also appends to `~/.weir/weir.log`, one timestamped line per change.
-
-For scripts, `weir sync --json` prints one JSON object per line as things happen: `start`, `plan`,
-one `repo` per repository worked on, then `finish`.
-
-### When a repository changes upstream
-
-| Upstream change | What weir does |
-|---|---|
-| Renamed | Renames the mirror's directory to match. No new clone. |
-| Transferred to another owner | If you track the new owner, the mirror moves there. If not, it is marked `transferred` and kept. |
-| Archived | Syncs it one last time, marks it `archived` and keeps it. It no longer shows in `weir list` (use `--archived`), `weir path` still finds it, and `weir prune` leaves it alone unless you pass `--archived`. An archived repository that was never mirrored is not cloned unless the owner is tracked with `--archived`. |
-| Unarchived | It becomes an ordinary mirror again. |
-| Deleted | Marked `gone` and kept until you run `weir prune`. |
-| Access lost | Marked `inaccessible` and kept. `weir prune` never deletes it. If access comes back, so does the mirror. |
-| Deleted and created again under the same name | The mirror follows the new repository, and the sync says `recreated`. |
-| Default branch changed, or force-pushed | The mirror moves to the new tip of the new default branch. |
-
-One caveat about "access lost": GitHub answers "not found" for a private repository that your
-token can no longer see, exactly as it does for a deleted one. weir can only report those as
-`gone`. That is one reason `prune` always asks before deleting.
-
-### Clones weir does not manage
-
-A directory under the root that weir does not know about is never synced, so it goes stale without
-anyone noticing. `weir status` counts them, and `weir doctor` explains each one:
-
-```
-$ weir doctor
-3 git repositories under /Users/me/Repos are not managed by weir. They are never synced.
-
-duplicate     /Users/me/Repos/github.com/acme/api-old
-              a stale copy of github.com/acme/api, whose mirror is /Users/me/Repos/github.com/acme/api
-gone          /Users/me/Repos/github.com/acme/prototype
-              not found on the provider (deleted, or no longer visible); this may be the only copy
-untracked     /Users/me/Repos/github.com/someone/tool
-              is github.com/someone/tool, which is not tracked
-```
-
-`weir prune --unmanaged` deletes the stale copies (`duplicate`) that have nothing to lose. It
-leaves every other kind alone, because some of them are the only copy of that code.
-
-### Existing clones
-
-If you already have clones laid out as `<root>/<host>/<owner>/<name>`, the first sync adopts them
-in place instead of cloning again. A local default branch with commits that were never pushed is
-kept and reported, and so are stashes. A clone that still points at an old name of a repository,
-or sits in a directory with the old name, is recognized by asking the provider, then corrected or
-moved into place.
-
-## Keeping mirrors current
-
-Run weir as a background service and the mirrors stay a few minutes behind their providers, all
-day, with nothing to schedule:
-
-```
-weir service install
-```
-
-That registers `weir daemon` with launchd (macOS) or systemd (Linux). It starts now, starts again at
-every login, and is restarted if it dies. The daemon runs the same sync as `weir sync`, on a loop:
-
-- **Every five minutes** (`interval_seconds`) it asks each provider what changed and syncs that.
-- **Checking is cheap.** Each listing is a conditional request. When nothing changed, the provider
-  answers "not modified", which does not count against the rate limit, and weir runs no git
-  commands at all.
-- **After sleep or a network drop it catches up at once.** While offline it waits quietly.
-- **It backs off when something is wrong:** longer waits after repeated failures, and until the
-  reset time when a rate limit is nearly used up.
-- **It stops cleanly.** On shutdown it stops the clones and fetches in flight, lets checkouts
-  finish, and exits. An interrupted clone leaves nothing behind, and the next cycle redoes it.
-- **Settings and accounts are re-read every cycle,** so `weir track`, `weir auth login` and
-  `weir config set` take effect without a restart.
-
-```
-weir service status     # is it installed, is it running, when is the next cycle
-weir service stop       # until the next login, or `weir service start`
-weir service uninstall
-weir status             # includes a "Daemon running: ..." line
-weir watch --follow     # watch each cycle as it happens
-```
-
-`weir sync` still works while the daemon runs: it waits for the cycle in progress, then runs.
-Use it after `weir track` if you do not want to wait for the next cycle, or with `--all` to fetch
-everything.
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `interval_seconds` | `300` | How often the daemon checks the providers |
-| `daemon_jobs` | `4` | How many repositories it works on at once |
-| `pause_on_battery` | `false` | Wait while the machine runs on its battery |
-
-The daemon's own notes go to `~/.weir/daemon.log`, and every change it makes to `~/.weir/weir.log`.
-
-### Without the service
-
-On a machine where you would rather not run a service, run `weir sync` from a scheduler. It waits
-up to a minute for the network.
-
-```
-# cron: every morning at 08:30
-30 8 * * *  /opt/homebrew/bin/weir sync --quiet
-```
-
-You can also run `weir daemon` under any process supervisor of your own.
-
-### Knowing that it is working
-
-Nobody watches a background sync, so weir makes a bad one hard to miss:
-
-- **`weir status` exits `1` when syncs have stopped succeeding.** It warns when the last successful
-  sync is older than `stale_after_hours` (36 by default) and shows the recent record, for example
-  `Last 7 runs: 6 ok, 1 with problems`. Call it from a shell prompt, a menu bar item or a monitor.
-- **`on_problem` runs a command when a sync ends with problems.** The summary arrives on standard
-  input and in `$WEIR_SUMMARY`; the details are in `$WEIR_PROBLEMS`. The daemon runs it when a
-  problem starts, not on every cycle it lasts.
-
-  ```
-  weir config set on_problem 'osascript -e "display notification \"$WEIR_SUMMARY\" with title \"weir\""'
-  ```
-
-`weir config list` shows every setting. `--json` on `status`, `list`, `log` and `doctor` gives the
-same information to a script.
+- **Mirrors that are never on a branch.** Each one sits on a detached HEAD at the tip of the
+  remote's default branch, with read-only files. Updating one is a fetch, never a merge.
+  [Mirrors](https://tjwaterman99.github.io/weir/concepts/mirrors.html)
+- **Several accounts per host.** Each owner goes through one account, and each mirror's git config
+  names it, so fetches and pushes sign in as the right user.
+  [Accounts](https://tjwaterman99.github.io/weir/concepts/accounts.html)
+- **Changes go through worktrees.** A worktree off a mirror is a writable checkout on its own
+  branch that shares the mirror's history.
+  [Worktrees](https://tjwaterman99.github.io/weir/guides/worktrees.html)
+- **A background daemon.** Every few minutes it asks what changed, at no cost when nothing did.
+  [Background](https://tjwaterman99.github.io/weir/guides/background.html)
+- **It follows what happens upstream.** Renames, transfers, archiving, deletion and lost access
+  each have a defined outcome.
+  [Upstream changes](https://tjwaterman99.github.io/weir/concepts/upstream-changes.html)
+- **It never discards work.** No reset, no clean, no stash. A mirror someone edited is skipped and
+  reported, and only `weir prune` deletes anything, after asking.
+  [What a sync does](https://tjwaterman99.github.io/weir/concepts/sync.html)
+- **It tells you when it is not working.** A live view of a running sync, a history of past runs,
+  and a status that fails when syncs stop succeeding.
+  [Monitoring](https://tjwaterman99.github.io/weir/guides/monitoring.html)
 
 ## Commands
 
 ```
-weir auth login <host> [--name NAME] [--env VAR | --command CMD]
-weir auth list
-weir auth logout <name>
-
-weir track <host>/<owner>[/<repo>] [--account NAME] [--include GLOB] [--exclude GLOB]
-           [--forks] [--archived] [--max-size MB]
-weir untrack <host>/<owner>[/<repo>]
-
-weir sync [<target>] [--dry-run] [--all] [--jobs N] [--network-wait SECONDS] [--no-wait]
-weir daemon [--interval SECONDS]
-weir service install|uninstall|start|stop|status
-weir prune [--dry-run] [--yes] [--archived] [--unmanaged]
-
-weir status [<target>]
-weir doctor
-weir list [<target>] [--archived] [--all]
-weir path <repo>
-weir watch [--follow]
-weir log [-n COUNT] [--slow] [--all]
-
-weir provider add <kind> <host> [--api-url URL]
-weir provider list
-weir config list
-weir config get|set|unset <setting> [<value>]
-weir version
+weir auth login|list|logout        accounts
+weir track / untrack               what to mirror
+weir sync                          bring every mirror up to date
+weir daemon / service              do that continuously, in the background
+weir status / list / path          what is mirrored, and where
+weir log / watch                   what syncs did, and what one is doing now
+weir doctor / prune                find and delete what is no longer needed
+weir provider / config / version   setup
 ```
 
-A `<target>` narrows a command to a host (`github.com`), an owner (`github.com/acme` or `acme`) or
-one repository (`acme/api`, or just `api` when only one repository has that name).
-
-`weir sync --all` fetches every repository instead of only those with new pushes. Use it if you
-suspect a mirror is behind.
-
-## Where things are kept
-
-| What | Where | Change it with |
-|---|---|---|
-| Mirrors | `~/Repos/<host>/<owner>/<name>` | `weir config set root <dir>` |
-| Database (accounts, what is tracked, every repository, sync history) | `~/.weir/weir.db` | the `WEIR_HOME` environment variable |
-| Log of every run | `~/.weir/weir.log` | the `WEIR_HOME` environment variable |
-| The daemon's own notes | `~/.weir/daemon.log` | the `WEIR_HOME` environment variable |
-| Tokens | the Keychain, an environment variable or a command | `weir auth login` |
-
-The database is a single SQLite file. Deleting it loses weir's memory, not your mirrors: track the
-same owners again and the next sync adopts what is on disk.
+Each one has a page in the
+[command reference](https://tjwaterman99.github.io/weir/reference/commands/index.html), and
+`weir <command> --help` prints the same text.
 
 ## Providers
 
-| Provider | Status |
-|---|---|
-| GitHub (github.com) | Supported |
-| GitHub Enterprise Server | Should work, since it has the same API, but it has not been tried against a real server: `weir provider add github git.example.com` |
-| GitLab, Bitbucket | Not implemented yet. The hosts are recognized, and tracking them reports that. |
-| `local` | A directory of bare repositories laid out as `<dir>/<owner>/<name>.git`. Used by the test suite. |
-
-## Limits
-
-- Mirrors follow the default branch only. Other branches are fetched (`git log origin/feature`
-  works) but never checked out.
-- Read-only means "hard to change by accident". Anyone who runs `chmod` can still edit a mirror;
-  the next sync reports it as `skipped`.
-- Mirrors are full clones. There is no shallow or partial clone option yet.
-- Submodules and Git LFS content are not fetched.
-- On macOS, a rebuilt `weir` binary may make the Keychain ask for permission again, because the
-  Keychain ties access to the exact program that stored the token.
+GitHub is supported. GitHub Enterprise Server should work but has not been tried against a real
+server. GitLab and Bitbucket are not implemented yet.
 
 ## Development
-
-Releases: bump `version` in `Cargo.toml`, merge, then push a tag `vX.Y.Z`. The release workflow
-tests and builds for macOS and Linux (Apple silicon, Intel and ARM), publishes a GitHub release and
-updates the Homebrew tap. A tag with a suffix, such as `v1.2.0-rc.1`, publishes a pre-release and
-leaves the tap alone.
 
 ```
 cargo test                                               # unit tests and end-to-end tests
@@ -456,3 +150,19 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 The end-to-end tests run the real binary against throwaway repositories in a temp directory. They
 use no network and never touch your own mirrors, database or git config. See `AGENTS.md` for the
 layout of the code and the rules a change has to keep.
+
+The documentation site is built from `docs/` with [mdBook](https://rust-lang.github.io/mdBook/):
+
+```
+mdbook serve docs                                        # preview at http://localhost:3000
+cargo run -- reference docs/src/reference/commands --examples docs/src/examples
+docs/capture-examples.sh                                 # refresh the example output
+```
+
+The command reference is generated from the command-line definitions; a test fails when it is out
+of date.
+
+Releases: bump `version` in `Cargo.toml`, merge, then push a tag `vX.Y.Z`. The release workflow
+tests and builds for macOS and Linux (Apple silicon, Intel and ARM), publishes a GitHub release and
+updates the Homebrew tap. A tag with a suffix, such as `v1.2.0-rc.1`, publishes a pre-release and
+leaves the tap alone.

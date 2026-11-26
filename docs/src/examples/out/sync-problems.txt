@@ -1,0 +1,4 @@
+$ weir sync
+healed    git.example.com/acme/web  (HEAD was on branch quick-fix)
+skipped   git.example.com/acme/docs  (has modified files; left as it is)
+weir: 1 healed, 1 skipped, 1 unchanged in 2s

@@ -1,0 +1,13 @@
+$ weir config list
+root               /Users/me/Repos
+                   Directory the mirrors live in
+stale_after_hours  36
+                   `weir status` warns, and exits 1, when no sync has succeeded for this long (0 turns it off)
+on_problem         (not set)
+                   Shell command to run when a sync ends with problems; it receives the summary on stdin and in $WEIR_SUMMARY
+interval_seconds   300
+                   How often `weir daemon` checks the providers
+daemon_jobs        4
+                   How many repositories `weir daemon` works on at once
+pause_on_battery   false
+                   Whether `weir daemon` waits while the machine runs on its battery (true or false)

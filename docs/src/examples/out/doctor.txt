@@ -1,0 +1,9 @@
+$ weir doctor
+2 git repositories under /Users/me/Repos are not managed by weir. They are never synced.
+
+duplicate     /Users/me/Repos/git.example.com/acme/api-old
+              a stale copy of git.example.com/acme/api, whose mirror is /Users/me/Repos/git.example.com/acme/api
+no-remote     /Users/me/Repos/git.example.com/acme/scratch
+              has no origin remote; this may be the only copy
+
+`weir prune --unmanaged` deletes the stale copies (kind: duplicate) that have nothing to lose.

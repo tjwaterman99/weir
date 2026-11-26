@@ -1,0 +1,2 @@
+$ weir path api
+/Users/me/Repos/git.example.com/acme/api

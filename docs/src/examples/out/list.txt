@@ -1,0 +1,4 @@
+$ weir list
+git.example.com/acme/api
+git.example.com/acme/docs
+git.example.com/acme/web
