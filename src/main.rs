@@ -153,7 +153,7 @@ enum Cmd {
         #[arg(long, hide = true)]
         cycles: Option<u64>,
     },
-    /// Run the daemon as a service that starts at login
+    /// Run the daemon as a service that starts at login (with Homebrew, use `brew services`)
     #[command(subcommand)]
     Service(ServiceCmd),
     /// Manage provider hosts (only needed for self-hosted providers)
@@ -1059,10 +1059,13 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<i32>
     println!();
     if let Some(line) = daemon::describe(conn)? {
         println!("{line}");
-    } else if service::definition_path().exists() {
-        println!(
-            "Daemon not running, though its service is installed; `weir service start` starts it."
-        );
+    } else if let Some((_, homebrew)) = service::installed() {
+        let start = if homebrew {
+            "brew services start weir"
+        } else {
+            "weir service start"
+        };
+        println!("Daemon not running, though its service is installed; `{start}` starts it.");
     }
     if let Some(run) = &running {
         println!("Sync running: {}", watch::progress(conn, run)?);

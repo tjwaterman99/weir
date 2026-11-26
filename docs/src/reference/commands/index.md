@@ -18,7 +18,7 @@ Every command, with the page that describes it.
 | [`weir log`](log.md) | Show past sync runs and what each one changed |
 | [`weir watch`](watch.md) | Follow a sync that is running, from any terminal |
 | [`weir daemon`](daemon.md) | Keep every mirror current: sync, wait, repeat, until stopped |
-| [`weir service`](service.md) | Run the daemon as a service that starts at login |
+| [`weir service`](service.md) | Run the daemon as a service that starts at login (with Homebrew, use `brew services`) |
 | [`weir provider`](provider.md) | Manage provider hosts (only needed for self-hosted providers) |
 | [`weir config`](config.md) | Read or change settings |
 | [`weir version`](version.md) | Print the version |

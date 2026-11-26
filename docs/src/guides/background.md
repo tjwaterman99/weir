@@ -3,12 +3,23 @@
 Run weir as a background service and the mirrors stay a few minutes behind their providers, all
 day, with nothing to schedule.
 
+With Homebrew:
+
+```text
+brew services start weir
+```
+
+Without Homebrew:
+
 ```text
 weir service install
 ```
 
-That registers `weir daemon` with launchd on macOS or systemd on Linux. It starts now, starts
-again at every login, and is restarted if it dies.
+Either one registers `weir daemon` with launchd on macOS or systemd on Linux. It starts now,
+starts again at every login, and is restarted if it dies.
+
+You can start it before you have added an account or tracked anything. It idles, looks again every
+30 seconds, and picks up your first `weir track` on its own.
 
 ## What the daemon does
 
@@ -26,8 +37,20 @@ It runs the same sync as `weir sync`, on a loop.
   take effect without a restart.
 - **It stops cleanly.** On shutdown it stops the clones and fetches in flight, lets checkouts
   finish, and exits. An interrupted clone leaves nothing behind, and the next cycle redoes it.
+- **It picks up upgrades.** When its binary is replaced, by `brew upgrade` or otherwise, it exits
+  at the start of its next cycle and the service manager starts the new version.
 
 ## Managing it
+
+With Homebrew:
+
+```text
+brew services info weir      # is it loaded and running?
+brew services stop weir
+brew services restart weir
+```
+
+Without Homebrew:
 
 ```text
 weir service status      # installed? running? when is the next cycle?
@@ -36,8 +59,12 @@ weir service start
 weir service uninstall   # stop it and remove the service
 ```
 
-`weir status` includes a line about the daemon, and `weir watch --follow` shows each cycle as it
-happens.
+Whichever started it, `weir status` and `weir service status` say whether the daemon is running
+and when its next cycle is, and `weir watch --follow` shows each cycle as it happens.
+
+One service manager owns the daemon. On a Homebrew install, `weir service install` and
+`weir service start` tell you to use `brew services`, so two services are never registered for
+the same daemon.
 
 ## Syncing by hand while it runs
 
@@ -62,7 +89,8 @@ weir config set interval_seconds 120
 
 | File | What |
 |---|---|
-| `~/.weir/daemon.log` | The daemon's own notes: started, stopped, offline, woke up |
+| `$(brew --prefix)/var/log/weir.log` | The daemon's own notes when Homebrew runs it: started, stopped, offline, woke up |
+| `~/.weir/daemon.log` | The same, when `weir service install` set it up |
 | `~/.weir/weir.log` | One line per change to a mirror, from every sync |
 
 ## On Linux
@@ -93,5 +121,5 @@ A service does not have your shell's environment.
 - **Keychain tokens** work as they are.
 - **`--command` tokens** need the full path to the command, for example
   `/opt/homebrew/bin/gh auth token --user myself`.
-- **`--env` tokens** need the variable to be set in the service's environment, which
-  `weir service install` does not do for you. Prefer `--command` or the Keychain here.
+- **`--env` tokens** need the variable to be set in the service's environment, which neither
+  `brew services` nor `weir service install` does for you. Prefer `--command` or the Keychain here.

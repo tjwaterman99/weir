@@ -7,9 +7,24 @@ already have.
 
 ```text
 brew install tjwaterman99/tap/weir
+brew services start weir
 ```
 
-That installs a prebuilt binary. `brew upgrade` picks up new releases.
+The first command installs a prebuilt binary. The second starts weir in the background and keeps
+it running; do it once you have added an account and tracked something, or before, as you like.
+See the [quick start](quick-start.md).
+
+`brew upgrade` picks up new releases, and the running daemon switches to the new version on its
+own.
+
+weir is not in Homebrew's core repository, so the first install names its tap,
+`tjwaterman99/tap`. After that the short name works everywhere: `brew services start weir`,
+`brew upgrade weir`. If you prefer to add the tap first:
+
+```text
+brew tap tjwaterman99/tap
+brew install weir
+```
 
 ## A release archive
 

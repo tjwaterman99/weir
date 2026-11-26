@@ -15,7 +15,7 @@ cloned    github.com/acme/api
 cloned    github.com/acme/web
 weir: 2 cloned in 4s
 
-$ weir service install        # from now on, mirrors stay a few minutes behind
+$ brew services start weir    # from now on, mirrors stay a few minutes behind
 
 $ rg "retry_policy" ~/Repos/github.com/acme
 ```

@@ -1,5 +1,8 @@
 ## Examples
 
+`weir service` is for installs without Homebrew. With Homebrew, run `brew services start weir`
+instead; `weir service status` works either way.
+
 ```text
 $ weir service install
 Installed /Users/me/Library/LaunchAgents/dev.weir.daemon.plist.

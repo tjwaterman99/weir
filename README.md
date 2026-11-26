@@ -15,7 +15,7 @@ cloned    github.com/acme/api
 cloned    github.com/acme/web
 weir: 2 cloned in 4s
 
-$ weir service install        # from now on, mirrors stay a few minutes behind
+$ brew services start weir    # from now on, mirrors stay a few minutes behind
 
 $ rg "retry_policy" ~/Repos/github.com/acme
 ```
@@ -49,9 +49,11 @@ With [Homebrew](https://brew.sh), on macOS or Linux:
 
 ```
 brew install tjwaterman99/tap/weir
+brew services start weir
 ```
 
-That installs a prebuilt binary. weir needs `git` on your `PATH`. The
+The first command installs a prebuilt binary; the second keeps your mirrors current in the
+background. weir needs `git` on your `PATH`. The
 [install page](https://tjwaterman99.github.io/weir/install.html) covers release archives and
 building from source.
 
@@ -84,8 +86,10 @@ building from source.
 4. **Keep it current.** Run weir in the background from now on.
 
    ```
-   weir service install
+   brew services start weir
    ```
+
+   Without Homebrew, `weir service install` does the same.
 
 5. **Use the mirrors.** They live at `~/Repos/<host>/<owner>/<name>`.
 

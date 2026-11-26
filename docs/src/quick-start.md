@@ -43,13 +43,14 @@ the last run, so a sync of several hundred repositories usually takes seconds:
 
 ## 4. Keep it current
 
-Let weir run in the background from now on:
+Let weir run in the background from now on. With Homebrew:
 
 ```text
-weir service install
+brew services start weir
 ```
 
-See [keeping mirrors current in the background](guides/background.md) for what that does.
+Without Homebrew, `weir service install` does the same. See
+[keeping mirrors current in the background](guides/background.md) for what the daemon does.
 
 ## 5. Use the mirrors
 

@@ -49,10 +49,22 @@ class Weir < Formula
     bin.install "weir"
   end
 
+  service do
+    run [opt_bin/"weir", "daemon"]
+    keep_alive true
+    process_type :background
+    log_path var/"log/weir.log"
+    error_log_path var/"log/weir.log"
+    environment_variables PATH: std_service_path_env
+  end
+
   def caveats
     <<~EOS
-      To keep your mirrors current in the background, run:
-        weir service install
+      Set up an account and say what to mirror:
+        weir auth login github.com
+        weir track github.com/<owner>
+      Then keep the mirrors current in the background:
+        brew services start weir
     EOS
   end
 

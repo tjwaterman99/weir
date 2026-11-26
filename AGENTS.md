@@ -54,6 +54,11 @@ tests, builds four targets, publishes a GitHub release, and writes `Formula/weir
 deploy key that can only write to the tap). Rehearse with a `-rc.N` tag: it publishes a pre-release
 and skips the tap. PR CI runs on Linux only; macOS is exercised by the release workflow.
 
+The formula declares a `service` that runs `weir daemon`, so the install cycle is
+`brew install tjwaterman99/tap/weir` then `brew services start weir`. One manager owns the daemon:
+on a Homebrew install `weir service install|start` refuse and point at `brew services`. The daemon
+exits when its binary is replaced, so an upgrade takes effect without a manual restart.
+
 ## Rules
 
 - **weir never discards work.** No `reset`, `clean`, `stash` or forced checkout on a mirror. A
