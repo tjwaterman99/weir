@@ -10,12 +10,13 @@ use std::fs::File;
 use std::io::{IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::db::{self, ProviderRow, RepoRow, TrackedRow};
 use crate::git::{self, Job, Outcome};
-use crate::provider::{self, AuthError, Lookup, RemoteRepo};
+use crate::provider::{self, AuthError, Cache, Lookup, RateLimit, RemoteRepo};
 use crate::secret::Source;
 use crate::settings;
 use crate::stray;
@@ -30,6 +31,24 @@ pub struct Opts {
     pub network_wait: u64,
     pub json: bool,
     pub quiet: bool,
+    /// Wait for a sync that is already running instead of giving up.
+    pub wait: bool,
+    /// Running as a cycle of `weir daemon`: stay quiet, and do not let a
+    /// history of idle cycles pile up.
+    pub daemon: bool,
+    /// Set from outside to stop early: no new work is started, clones and
+    /// fetches in flight are stopped, checkouts are allowed to finish.
+    pub stop: Option<Arc<AtomicBool>>,
+}
+
+/// How a run ended, for callers that need more than an exit code.
+pub struct Report {
+    pub code: i32,
+    pub ok: bool,
+    /// It was stopped early through `Opts::stop`.
+    pub stopped: bool,
+    /// When a provider's rate limit resets, if this run ran into it.
+    pub rate_reset: Option<i64>,
 }
 
 /// One line of sync output: something that happened to one repository.
@@ -53,15 +72,24 @@ struct Plan {
     events: Vec<Event>,
     problems: Vec<String>,
     unchanged: usize,
+    rate_reset: Option<i64>,
 }
+
+/// Below this many requests left, weir stops listing until the limit resets.
+const RATE_FLOOR: u64 = 25;
 
 /// How many past runs are kept for `weir log`.
 const RUNS_KEPT: i64 = 500;
 
 /// Runs a sync and returns the process exit code.
 pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
+    Ok(run_report(conn, o)?.code)
+}
+
+pub fn run_report(conn: &Connection, o: &Opts) -> Result<Report> {
     let root = settings::root(conn)?;
-    let _lock = if o.dry_run { None } else { Some(lock()?) };
+    let _lock = if o.dry_run { None } else { Some(lock(o.wait)?) };
+    let stopping = || o.stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
     let started = Instant::now();
 
     let run_id = if o.dry_run {
@@ -144,7 +172,12 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
             });
         }
         ui.finish(&plan.problems, true);
-        return Ok(if plan.problems.is_empty() { 0 } else { 1 });
+        return Ok(Report {
+            code: if plan.problems.is_empty() { 0 } else { 1 },
+            ok: plan.problems.is_empty(),
+            stopped: false,
+            rate_reset: plan.rate_reset,
+        });
     };
 
     conn.execute(
@@ -176,11 +209,18 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
     let (tx, rx) = mpsc::channel();
     let workers = o.jobs.max(1);
     let mut failure: Option<anyhow::Error> = None;
+    let mut aborted = false;
+    let planned_jobs = ui.total;
+    let planned_events = plan.events.len();
     std::thread::scope(|s| {
         for _ in 0..workers {
             let tx = tx.clone();
             let queue = &queue;
+            let stop = o.stop.clone();
             s.spawn(move || loop {
+                if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                    break;
+                }
                 let job = queue.lock().unwrap().next();
                 let Some(job) = job else { break };
                 let label = match job.size_kb {
@@ -210,11 +250,22 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
                 }
                 Ok(Msg::Done(job, outcome, millis)) => (job, outcome, millis),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if stopping() && !aborted {
+                        // Stop what can be stopped safely, once.
+                        git::abort_network();
+                        aborted = true;
+                    }
                     ui.tick();
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            ui.current
+                .retain(|(label, _)| !label.starts_with(job.repo.as_str()));
+            if aborted && outcome.action == git::Action::Failed {
+                // Stopped by us, not broken: leave its record as it was.
+                continue;
+            }
             let event = Event {
                 action: outcome.action.as_str().to_string(),
                 repo: job.repo.clone(),
@@ -257,8 +308,6 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
             if let Err(e) = stored {
                 failure.get_or_insert(e);
             }
-            ui.current
-                .retain(|(label, _)| !label.starts_with(job.repo.as_str()));
             ui.done += 1;
             ui.event(&event);
             let _ = heartbeat(conn, run_id, &ui);
@@ -269,28 +318,53 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
         return Err(e.context("could not record sync results"));
     }
 
+    let stopped = stopping();
     let bad = ui.count("failed") + ui.count("skipped");
-    let ok = bad == 0 && plan.problems.is_empty();
+    let ok = bad == 0 && plan.problems.is_empty() && !stopped;
+    let idle = ok && planned_jobs == 0 && planned_events == 0;
     let mut summary = serde_json::to_value(&ui.counts)?;
     summary["problems"] = json!(plan.problems);
+    // The run before this one, to tell a new problem from a continuing one.
+    let previous_ok: Option<bool> = conn
+        .query_row(
+            "SELECT ok FROM sync_runs WHERE id < ?1 AND finished_at IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+            [run_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
     conn.execute(
         "UPDATE sync_runs SET finished_at = ?1, seconds = ?2, summary = ?3, ok = ?4,
-                phase = 'done', current = NULL, done = ?5
-         WHERE id = ?6",
+                phase = ?5, current = NULL, done = ?6, idle = ?7
+         WHERE id = ?8",
         params![
             util::now(),
             started.elapsed().as_secs() as i64,
             summary.to_string(),
             ok,
+            if stopped { "stopped" } else { "done" },
             ui.done as i64,
+            idle,
             run_id
         ],
     )?;
+    if o.daemon && idle {
+        // A daemon cycle with nothing to do replaces the idle run before it,
+        // so the history keeps what happened, not every time nothing did.
+        conn.execute("DELETE FROM sync_runs WHERE idle = 1 AND id < ?1", [run_id])?;
+    }
     ui.finish(&plan.problems, false);
-    if !ok {
+    // A daemon reports a problem when it starts, not on every cycle it lasts.
+    if !ok && !stopped && !(o.daemon && previous_ok == Some(false)) {
         on_problem(conn, run_id, &ui, &plan.problems);
     }
-    Ok(if ok { 0 } else { 1 })
+    Ok(Report {
+        code: if ok { 0 } else { 1 },
+        ok,
+        stopped,
+        rate_reset: plan.rate_reset,
+    })
 }
 
 /// Writes how far the run has got, for `weir status` and `weir watch`.
@@ -419,6 +493,8 @@ pub fn status_line(
 ) -> String {
     let mut line = if total == 0 && done == 0 {
         phase.to_string()
+    } else if counts.values().all(|n| *n == 0) {
+        format!("[{done}/{total}]")
     } else {
         format!("[{done}/{total}] {}", summarize(counts))
     };
@@ -475,6 +551,8 @@ struct Ui {
     /// Lines describing what went wrong, for the summary and `on_problem`.
     trouble: Vec<String>,
     drawn: bool,
+    daemon: bool,
+    unlogged_start: bool,
     last_plain: Instant,
     log: Option<File>,
 }
@@ -495,6 +573,8 @@ impl Ui {
             current: Vec::new(),
             trouble: Vec::new(),
             drawn: false,
+            daemon: o.daemon,
+            unlogged_start: false,
             last_plain: Instant::now(),
             log: if o.dry_run { None } else { open_log() },
         }
@@ -506,6 +586,9 @@ impl Ui {
 
     fn log(&mut self, text: &str) {
         if let (Some(file), Some(id)) = (&mut self.log, self.run_id) {
+            if std::mem::take(&mut self.unlogged_start) {
+                let _ = writeln!(file, "{}  run {id}  started", util::now());
+            }
             let _ = writeln!(file, "{}  run {id}  {text}", util::now());
         }
     }
@@ -517,7 +600,12 @@ impl Ui {
                 json!({ "event": "start", "run_id": self.run_id, "dry_run": self.dry_run })
             );
         }
-        self.log("started");
+        if self.daemon {
+            // Written only if the cycle turns out to have something to say.
+            self.unlogged_start = true;
+        } else {
+            self.log("started");
+        }
     }
 
     fn phase(&mut self, text: String) {
@@ -622,7 +710,9 @@ impl Ui {
         for p in problems {
             self.log(&format!("problem   {p}"));
         }
-        self.log(&format!("finished: {summary} in {seconds}s"));
+        if !self.unlogged_start {
+            self.log(&format!("finished: {summary} in {seconds}s"));
+        }
         if self.json {
             println!(
                 "{}",
@@ -667,10 +757,17 @@ fn lock_file() -> Result<File> {
         .with_context(|| format!("could not open {}", path.display()))
 }
 
-pub fn lock() -> Result<File> {
+/// Takes the lock that keeps two syncs from touching the same mirrors. With
+/// `wait`, a sync that is already running is waited for instead of refused.
+pub fn lock(wait: bool) -> Result<File> {
     let file = lock_file()?;
     match file.try_lock() {
         Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) if wait => {
+            eprintln!("weir: another sync is running; waiting for it to finish (see `weir watch`)");
+            file.lock().context("could not take the sync lock")?;
+            Ok(file)
+        }
         Err(std::fs::TryLockError::WouldBlock) => bail!("another weir sync is already running"),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("could not take the sync lock"),
     }
@@ -689,6 +786,11 @@ pub fn is_running() -> bool {
         Err(std::fs::TryLockError::WouldBlock) => true,
         Err(std::fs::TryLockError::Error(_)) => false,
     }
+}
+
+/// Whether `endpoint` accepts a connection right now.
+pub fn reachable(endpoint: &str) -> bool {
+    wait_for(endpoint, 0, true)
 }
 
 /// Waits until `endpoint` accepts connections, for a machine that has just
@@ -803,7 +905,10 @@ fn plan(conn: &Connection, o: &Opts, root: &Path, ui: &mut Ui) -> Result<Plan> {
         events: Vec::new(),
         problems: Vec::new(),
         unchanged: 0,
+        rate_reset: None,
     };
+    // What each provider last said about its rate limit.
+    let mut limits: HashMap<i64, RateLimit> = HashMap::new();
     // One entry per account: its token, or None once it has failed. A failed
     // account is reported once and its other owners are skipped quietly.
     let mut creds: HashMap<i64, Option<Credentials>> = HashMap::new();
@@ -861,6 +966,32 @@ fn plan(conn: &Connection, o: &Opts, root: &Path, ui: &mut Ui) -> Result<Plan> {
             }
         }
         let cred = account_id.and_then(|id| creds[&id].as_ref());
+        // From here on, listings are conditional requests answered from the
+        // cache when nothing changed. Each account has its own view.
+        let prov = match provider::build_cached(
+            p,
+            Some(Cache {
+                conn,
+                scope: cred.map(|c| c.name.clone()).unwrap_or_default(),
+            }),
+        ) {
+            Ok(prov) => prov,
+            Err(e) => {
+                plan.problems.push(format!("{label}: {e:#}"));
+                continue;
+            }
+        };
+        if let Some(limit) = limits.get(&p.id) {
+            let wait = limit.reset - util::unix_now();
+            if limit.remaining < RATE_FLOOR && wait > 0 {
+                plan.problems.push(format!(
+                    "{label}: not listed, the rate limit of {} is nearly used up; it resets in {}",
+                    p.host,
+                    util::ago(wait)
+                ));
+                continue;
+            }
+        }
 
         if let Some(endpoint) = prov.endpoint() {
             let up = *reachable
@@ -880,6 +1011,9 @@ fn plan(conn: &Connection, o: &Opts, root: &Path, ui: &mut Ui) -> Result<Plan> {
             prov.get_repo(&t.owner, &t.repo, token)
                 .map(|found| found.into_iter().collect())
         };
+        if let Some(limit) = prov.rate_limit() {
+            limits.insert(p.id, limit);
+        }
         let remote = match result {
             Ok(r) => r,
             Err(e) => {
@@ -1108,6 +1242,11 @@ fn plan(conn: &Connection, o: &Opts, root: &Path, ui: &mut Ui) -> Result<Plan> {
             });
         }
     }
+    plan.rate_reset = limits
+        .values()
+        .filter(|l| l.remaining < RATE_FLOOR)
+        .map(|l| l.reset)
+        .max();
     Ok(plan)
 }
 
@@ -1127,7 +1266,12 @@ fn old_name_of(p: &ProviderRow, path: &Path, r: &RepoRow, token: Option<&str>) -
 /// A cheap check that a mirror's HEAD is still detached where weir left it,
 /// done by reading one file, so it can run on every mirror on every sync.
 fn head_in_place(path: &Path, expected: Option<&str>) -> bool {
-    let Ok(head) = std::fs::read_to_string(path.join(".git").join("HEAD")) else {
+    let git_dir = path.join(".git");
+    // A leftover marker means a checkout was interrupted and must be finished.
+    if git_dir.join(git::CHECKOUT_MARKER).exists() {
+        return false;
+    }
+    let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) else {
         return false;
     };
     match expected {
@@ -1226,6 +1370,17 @@ mod tests {
         assert_eq!(
             status_line("listing github.com/acme", 0, 0, &counts, 12, &[]),
             "listing github.com/acme · 12s"
+        );
+        assert_eq!(
+            status_line(
+                "syncing",
+                0,
+                1,
+                &counts,
+                9,
+                &[("github.com/acme/big (1.0 GB)".to_string(), 9)]
+            ),
+            "[0/1] · 9s · big (1.0 GB)"
         );
         counts.insert("cloned".to_string(), 3);
         counts.insert("unchanged".to_string(), 380);

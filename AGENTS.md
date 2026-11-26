@@ -7,6 +7,8 @@ Rust CLI (`weir`). One binary, no async. Read `README.md` first for what it does
   pool) and everything a sync shows: the live status line, streamed JSON, the log file.
 - `src/runs.rs`, `src/watch.rs`: reading run history, and `weir watch`. A running sync writes its
   progress to its `sync_runs` row; other processes read it from there.
+- `src/daemon.rs`: `weir daemon`, the sync engine on a loop (offline, battery, backoff, wake-up).
+  `src/service.rs`: `weir service`, which registers it with launchd or systemd.
 - `src/settings.rs`: the settings (`weir config`). Add a setting there, with a default and help.
 - `src/git.rs`: everything done to a mirror on disk, by running `git`.
 - `src/provider.rs`: the `Provider` trait, GitHub, and the `local` provider (a directory of bare repositories).
@@ -29,7 +31,14 @@ them locally.
 ## Rules
 
 - **weir never discards work.** No `reset`, `clean`, `stash` or forced checkout on a mirror. A
-  mirror with modified files is skipped and reported. Keep that tested.
+  mirror with modified files is skipped and reported. Keep that tested. The single exception is
+  finishing weir's own interrupted checkout, recognized by the `.git/weir-checkout` marker that is
+  written only after the tree was verified clean.
+- **Interruption must be safe at every step.** Clones go to a `.weir-clone-*` directory and are
+  renamed into place when complete. On shutdown only clones and fetches are stopped
+  (`git::abort_network`); a checkout is left to finish.
+- **Listings are conditional requests** (`http_cache` table, one view per account). An idle daemon
+  cycle must cost no rate limit and run no git command against a GitHub provider.
 - **Only `weir prune` deletes**, and only mirrors with nothing to lose (`git::blockers`).
 - **A failed or partial listing never marks repositories as gone.** Only a listing that succeeded
   does, and a repository that dropped out of one is looked up by id before its state changes. If

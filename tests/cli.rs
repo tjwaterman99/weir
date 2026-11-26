@@ -1067,7 +1067,7 @@ fn only_one_sync_runs_at_a_time() {
         .open(env.p("home").join("sync.lock"))
         .unwrap();
     lock.lock().unwrap();
-    let blocked = env.weir(&["sync"]);
+    let blocked = env.weir(&["sync", "--no-wait"]);
     assert_eq!(blocked.code, 2);
     assert!(
         blocked.stderr.contains("already running"),
@@ -1308,7 +1308,7 @@ fn status_and_watch_follow_a_sync_in_progress() {
             "{}",
             status.stdout
         );
-        let second = env.weir(&["sync"]);
+        let second = env.weir(&["sync", "--no-wait"]);
         assert_eq!(second.code, 2, "{}", second.stderr);
 
         // Attached from "another terminal": it sees the rest of the run and its result.
@@ -1330,4 +1330,341 @@ fn status_and_watch_follow_a_sync_in_progress() {
     });
     assert!(env.ok(&["watch"]).stdout.contains("No sync is running."));
     assert!(!env.ok(&["status"]).stdout.contains("Sync running"));
+}
+
+fn wait_until(what: &str, done: &dyn Fn() -> bool) {
+    for _ in 0..150 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn daemon_keeps_mirrors_current_until_stopped() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+
+    let mut c = Command::new(env!("CARGO_BIN_EXE_weir"));
+    env.isolate(&mut c);
+    let child = c
+        .args(["daemon", "--interval", "1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // It clones what is tracked, without anyone running `weir sync`.
+    let app = env.mirror("acme", "app");
+    wait_until("the first clone", &|| app.join(".git").is_dir());
+    // A push shows up within an interval.
+    env.push("acme", "app", "README.md", "two\n");
+    let want = env.upstream_head("acme", "app");
+    wait_until("the push to arrive", &|| {
+        env.try_git(&app, &["rev-parse", "HEAD"]).as_deref() == Some(want.as_str())
+    });
+    // So does a new repository.
+    env.make_repo("acme", "new");
+    wait_until("the new repository", &|| {
+        env.mirror("acme", "new").join(".git").is_dir()
+    });
+
+    assert!(env.ok(&["status"]).stdout.contains("Daemon running"));
+    let second = env.weir(&["daemon"]);
+    assert_eq!(second.code, 2, "a second daemon must be refused");
+    assert!(
+        second.stderr.contains("already running"),
+        "{}",
+        second.stderr
+    );
+    // A manual sync works alongside it: it waits its turn.
+    assert_eq!(env.weir(&["sync"]).code, 0);
+
+    // Cycles with nothing to do must not pile up in the history.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    let conn = db(&env);
+    let idle: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_runs WHERE idle = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_runs", [], |r| r.get(0))
+        .unwrap();
+    assert!(idle <= 1, "{idle} idle runs kept");
+    assert!(total <= 5, "{total} runs kept");
+
+    // SIGTERM stops it cleanly.
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+    let notes = String::from_utf8_lossy(&out.stderr);
+    assert!(notes.contains("weir daemon stopped"), "{notes}");
+    assert!(!env.ok(&["status"]).stdout.contains("Daemon running"));
+    assert_eq!(env.weir(&["service", "status"]).code, 1);
+    env.assert_mirror("acme", "app");
+    env.assert_mirror("acme", "new");
+}
+
+#[test]
+fn daemon_settings_are_validated() {
+    let env = Env::new();
+    env.ok(&["config", "set", "interval_seconds", "60"]);
+    assert_eq!(
+        env.weir(&["config", "set", "interval_seconds", "0"]).code,
+        2
+    );
+    assert_eq!(
+        env.weir(&["config", "set", "pause_on_battery", "maybe"])
+            .code,
+        2
+    );
+    env.ok(&["config", "set", "pause_on_battery", "true"]);
+    let list = env.ok(&["config", "list"]).stdout;
+    assert!(list.contains("interval_seconds   60"), "{list}");
+    // One cycle, then exit: nothing tracked is an error it reports, not a crash.
+    let once = env.weir(&["config", "set", "pause_on_battery", "false"]);
+    assert_eq!(once.code, 0);
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+    let run = env.weir(&["daemon", "--cycles", "1"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    env.assert_mirror("acme", "app");
+}
+
+#[test]
+fn finishes_its_own_interrupted_checkout() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["sync"]);
+
+    // What a kill in the middle of a checkout leaves: the marker weir wrote
+    // before it started, and files that match neither commit.
+    env.push("acme", "app", "README.md", "two\n");
+    let m = env.mirror("acme", "app");
+    let file = m.join("README.md");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&file, "half writ").unwrap();
+    std::fs::write(m.join(".git").join("weir-checkout"), "interrupted").unwrap();
+
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout
+            .contains("finished a checkout that was interrupted"),
+        "{}",
+        run.stdout
+    );
+    assert!(!m.join(".git").join("weir-checkout").exists());
+    env.assert_mirror("acme", "app");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "two\n");
+}
+
+#[test]
+fn an_interrupted_clone_leaves_nothing_behind() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    // What a killed clone leaves: a temporary directory next to the mirror's path.
+    let leftover = env.mirror("acme", ".weir-clone-app-99999");
+    std::fs::create_dir_all(leftover.join(".git")).unwrap();
+    std::fs::write(leftover.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    env.ok(&["track", "local.test/acme"]);
+    // It is not mistaken for a clone someone made.
+    assert!(env.ok(&["doctor"]).stdout.contains("is managed by weir"));
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout.contains("cloned    local.test/acme/app"),
+        "{}",
+        run.stdout
+    );
+    assert!(!leftover.exists());
+    env.assert_mirror("acme", "app");
+    let names: Vec<String> = std::fs::read_dir(env.mirror("acme", "app").parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["app"]);
+}
+
+#[test]
+fn a_sync_waits_for_the_one_that_is_running() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+    let lock = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(env.p("home").join("sync.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    std::thread::scope(|s| {
+        let waiting = s.spawn(|| env.weir(&["sync"]));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(
+            !env.mirror("acme", "app").exists(),
+            "it must not start early"
+        );
+        drop(lock);
+        let run = waiting.join().unwrap();
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert!(
+            run.stderr.contains("waiting for it to finish"),
+            "{}",
+            run.stderr
+        );
+    });
+    env.assert_mirror("acme", "app");
+}
+
+/// A stand-in for GitHub that sees the whole request, for tests about headers.
+fn serve_raw(listener: TcpListener, respond: impl Fn(&str) -> String + Send + 'static) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+            }
+            let response = respond(&String::from_utf8_lossy(&raw));
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+}
+
+fn http(code: u16, headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[test]
+fn unchanged_listings_cost_nothing_and_the_rate_limit_is_respected() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let env = Env::new();
+    let a = env.make_repo("acme", "a");
+    let b = env.make_repo("beta", "b");
+    let not_modified = Arc::new(AtomicUsize::new(0));
+    let beta_requests = Arc::new(AtomicUsize::new(0));
+    let nearly_out = Arc::new(AtomicBool::new(false));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (seen_304, seen_beta, low) = (
+        not_modified.clone(),
+        beta_requests.clone(),
+        nearly_out.clone(),
+    );
+    serve_raw(listener, move |request| {
+        let path = request.split_whitespace().nth(1).unwrap_or("");
+        let lower = request.to_lowercase();
+        let reset = 4_000_000_000u64;
+        let left = if low.load(Ordering::Relaxed) { 3 } else { 4000 };
+        let limit = format!("x-ratelimit-remaining: {left}\r\nx-ratelimit-reset: {reset}\r\n");
+        // Each resource has an ETag; a request that already has it gets a 304.
+        let conditional = |etag: &str, body: String| {
+            if lower.contains(&format!("if-none-match: {etag}")) {
+                seen_304.fetch_add(1, Ordering::Relaxed);
+                http(304, &limit, "")
+            } else {
+                http(200, &format!("ETag: {etag}\r\n{limit}"), &body)
+            }
+        };
+        if path.contains("beta") {
+            seen_beta.fetch_add(1, Ordering::Relaxed);
+        }
+        match path {
+            "/user" => http(200, "", r#"{"login":"worker","id":1}"#),
+            "/users/acme" => conditional(
+                "\"u1\"",
+                r#"{"login":"acme","id":9,"type":"Organization","bio":"not needed"}"#.into(),
+            ),
+            "/orgs/acme/repos?type=all&per_page=100" => {
+                conditional("\"p1\"", format!("[{}]", gh_repo(1, "acme", "a", &a, "t1")))
+            }
+            "/users/beta" => conditional(
+                "\"u2\"",
+                r#"{"login":"beta","id":8,"type":"Organization"}"#.into(),
+            ),
+            "/orgs/beta/repos?type=all&per_page=100" => {
+                conditional("\"p2\"", format!("[{}]", gh_repo(2, "beta", "b", &b, "t1")))
+            }
+            _ => http(404, "", r#"{"message":"Not Found"}"#),
+        }
+    });
+
+    let weir = |args: &[&str]| env.weir_env(&[("TOKEN", "tok")], args);
+    assert_eq!(
+        weir(&["provider", "add", "github", "ghe.test", "--api-url", &base]).code,
+        0
+    );
+    assert_eq!(
+        weir(&["auth", "login", "ghe.test", "--env", "TOKEN", "--name", "work"]).code,
+        0
+    );
+    assert_eq!(weir(&["track", "ghe.test/acme"]).code, 0);
+
+    let first = weir(&["sync"]);
+    assert_eq!(first.code, 0, "{}{}", first.stdout, first.stderr);
+    assert_eq!(not_modified.load(Ordering::Relaxed), 0);
+
+    // Nothing changed: both requests are answered "not modified", and the
+    // listing still works from what was remembered.
+    let second = weir(&["sync"]);
+    assert_eq!(second.code, 0, "{}{}", second.stdout, second.stderr);
+    assert!(second.stdout.contains("1 unchanged"), "{}", second.stdout);
+    assert_eq!(not_modified.load(Ordering::Relaxed), 2);
+    let cached: Vec<String> = {
+        let conn = db(&env);
+        let mut st = conn
+            .prepare("SELECT body FROM http_cache ORDER BY url")
+            .unwrap();
+        let rows = st.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(cached.len(), 2);
+    assert!(
+        cached.iter().all(|body| !body.contains("not needed")),
+        "{cached:?}"
+    );
+
+    // With the rate limit nearly used up, weir stops asking and says when it resets.
+    assert_eq!(weir(&["track", "ghe.test/beta"]).code, 0);
+    nearly_out.store(true, Ordering::Relaxed);
+    let limited = weir(&["sync"]);
+    assert_eq!(limited.code, 1, "{}{}", limited.stdout, limited.stderr);
+    assert!(
+        limited
+            .stderr
+            .contains("ghe.test/beta: not listed, the rate limit of ghe.test is nearly used up"),
+        "{}",
+        limited.stderr
+    );
+    assert_eq!(beta_requests.load(Ordering::Relaxed), 0);
+    assert!(!env.p("root").join("ghe.test/beta").exists());
+
+    // Once there is room again, the owner that was skipped is mirrored.
+    nearly_out.store(false, Ordering::Relaxed);
+    db(&env).execute("DELETE FROM http_cache", []).unwrap();
+    let recovered = weir(&["sync"]);
+    assert_eq!(
+        recovered.code, 0,
+        "{}{}",
+        recovered.stdout, recovered.stderr
+    );
+    assert!(env.p("root").join("ghe.test/beta/b").exists());
 }

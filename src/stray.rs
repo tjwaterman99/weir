@@ -55,7 +55,8 @@ pub fn scan(conn: &Connection, root: &Path) -> Result<Vec<Stray>> {
             for entry in names.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !path.join(".git").is_dir() {
+                // A half-finished clone of weir's own is not a stray.
+                if !path.join(".git").is_dir() || name.starts_with(git::CLONE_PREFIX) {
                     continue;
                 }
                 if known.contains(&(p.id, format!("{owner}/{name}").to_lowercase())) {

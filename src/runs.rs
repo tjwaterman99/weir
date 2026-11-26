@@ -68,7 +68,7 @@ impl RunRow {
     /// One word for how the run ended.
     pub fn verdict(&self) -> &'static str {
         match (self.phase.as_deref(), self.finished_at.is_some(), self.ok) {
-            (Some("interrupted"), _, _) => "interrupted",
+            (Some("interrupted" | "stopped"), _, _) => "interrupted",
             (Some("failed"), _, _) => "failed",
             (_, false, _) => "unfinished",
             (_, true, Some(true)) => "ok",
