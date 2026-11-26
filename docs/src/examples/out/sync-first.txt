@@ -1,0 +1,5 @@
+$ weir sync
+cloned    git.example.com/acme/docs
+cloned    git.example.com/acme/api
+cloned    git.example.com/acme/web
+weir: 3 cloned in 2s

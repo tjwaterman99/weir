@@ -1,0 +1,3 @@
+$ weir sync
+updated   git.example.com/acme/api  8cd6e4e -> dc5f212
+weir: 1 updated, 2 unchanged in 2s

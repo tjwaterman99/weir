@@ -1,0 +1,10 @@
+$ weir log -n 3
+run 5  2026-11-26T08:30:00Z  ok  0s (1s listing)  1 cloned, 1 archived, 1 gone, 2 unchanged
+  archived  git.example.com/acme/web  (archived on the provider; mirror kept)
+  gone      git.example.com/acme/docs  (no longer on the provider; mirror kept)
+  cloned    git.example.com/acme/cli
+run 4  2026-11-26T08:30:00Z  ok  0s (1s listing)  1 updated, 2 unchanged
+  updated   git.example.com/acme/docs  15ab9a1 -> 3a951fd
+run 3  2026-11-26T08:30:00Z  problems  0s (1s listing)  1 healed, 1 skipped, 1 unchanged
+  healed    git.example.com/acme/web  (HEAD was on branch quick-fix)
+  skipped   git.example.com/acme/docs  (has modified files; left as it is)
