@@ -1,11 +1,14 @@
 mod db;
 mod git;
 mod provider;
+mod runs;
 mod secret;
+mod settings;
 mod stray;
 mod sync;
 mod target;
 mod util;
+mod watch;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -57,6 +60,9 @@ enum Cmd {
         /// Also mirror archived repositories
         #[arg(long)]
         archived: bool,
+        /// Skip repositories larger than this many megabytes
+        #[arg(long, value_name = "MB")]
+        max_size: Option<i64>,
     },
     /// Stop mirroring an owner or repository; its mirrors stay on disk
     Untrack {
@@ -119,6 +125,18 @@ enum Cmd {
         /// How many runs to show
         #[arg(short = 'n', default_value_t = 5)]
         count: usize,
+        /// Also list repositories that were fetched and had not changed
+        #[arg(long)]
+        all: bool,
+        /// Show the ten slowest repositories of each run instead
+        #[arg(long, conflicts_with = "all")]
+        slow: bool,
+    },
+    /// Follow a sync that is running, from any terminal
+    Watch {
+        /// Keep watching after it ends, and follow the next ones too
+        #[arg(long)]
+        follow: bool,
     },
     /// Manage provider hosts (only needed for self-hosted providers)
     #[command(subcommand)]
@@ -176,10 +194,14 @@ enum ProviderCmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
+    /// Show every setting, its value and what it does
+    List,
     /// Print a setting
     Get { key: String },
     /// Change a setting
     Set { key: String, value: String },
+    /// Put a setting back to its default
+    Unset { key: String },
 }
 
 fn main() {
@@ -216,7 +238,10 @@ fn run(cli: Cli) -> Result<i32> {
             exclude,
             forks,
             archived,
-        } => track(&conn, &target, account, include, exclude, forks, archived)?,
+            max_size,
+        } => track(
+            &conn, &target, account, include, exclude, forks, archived, max_size,
+        )?,
         Cmd::Untrack { target } => untrack(&conn, &target)?,
         Cmd::Sync {
             target,
@@ -245,14 +270,15 @@ fn run(cli: Cli) -> Result<i32> {
             unmanaged,
         } => prune(&conn, dry_run, yes, archived, unmanaged)?,
         Cmd::Doctor => doctor(&conn, cli.json)?,
-        Cmd::Status { target } => status(&conn, target.as_deref(), cli.json)?,
+        Cmd::Status { target } => return status(&conn, target.as_deref(), cli.json),
         Cmd::List {
             target,
             archived,
             all,
         } => list(&conn, target.as_deref(), archived, all, cli.json)?,
         Cmd::Path { repo } => path(&conn, &repo)?,
-        Cmd::Log { count } => log(&conn, count, cli.json)?,
+        Cmd::Log { count, all, slow } => log(&conn, count, all, slow, cli.json)?,
+        Cmd::Watch { follow } => return watch::watch(&conn, follow),
         Cmd::Provider(ProviderCmd::Add {
             kind,
             host,
@@ -263,8 +289,13 @@ fn run(cli: Cli) -> Result<i32> {
                 println!("{:<10} {:<24} {}", p.kind, p.host, p.api_url);
             }
         }
+        Cmd::Config(ConfigCmd::List) => config_list(&conn, cli.json)?,
         Cmd::Config(ConfigCmd::Get { key }) => config_get(&conn, &key)?,
         Cmd::Config(ConfigCmd::Set { key, value }) => config_set(&conn, &key, &value)?,
+        Cmd::Config(ConfigCmd::Unset { key }) => {
+            settings::unset(&conn, &key)?;
+            println!("{key} is back to its default.");
+        }
         Cmd::Credential { account, operation } => credential(&conn, &account, operation)?,
         Cmd::Version => unreachable!(),
     }
@@ -434,6 +465,7 @@ fn credential(conn: &Connection, account: &str, operation: Option<String>) -> Re
 
 // ----------------------------------------------------------------- track
 
+#[allow(clippy::too_many_arguments)]
 fn track(
     conn: &Connection,
     target: &str,
@@ -442,8 +474,12 @@ fn track(
     exclude: Vec<String>,
     forks: bool,
     archived: bool,
+    max_size: Option<i64>,
 ) -> Result<()> {
     let (p, owner, repo) = target::parse_full(conn, target)?;
+    if max_size.is_some_and(|mb| mb <= 0) {
+        bail!("--max-size must be a positive number of megabytes");
+    }
     let prov = provider::build(&p)?;
     for pattern in include.iter().chain(&exclude) {
         glob::Pattern::new(pattern).with_context(|| format!("{pattern:?} is not a valid glob"))?;
@@ -525,11 +561,11 @@ fn track(
         )?;
     }
     conn.execute(
-        "INSERT INTO tracked (provider_id, account_id, owner, repo, include, exclude, forks, archived, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO tracked (provider_id, account_id, owner, repo, include, exclude, forks, archived, created_at, max_size_mb)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT (provider_id, owner, repo) DO UPDATE SET
            account_id = excluded.account_id, include = excluded.include, exclude = excluded.exclude,
-           forks = excluded.forks, archived = excluded.archived",
+           forks = excluded.forks, archived = excluded.archived, max_size_mb = excluded.max_size_mb",
         params![
             p.id,
             account_id,
@@ -539,7 +575,8 @@ fn track(
             serde_json::to_string(&exclude)?,
             forks,
             archived,
-            util::now()
+            util::now(),
+            max_size
         ],
     )?;
     let through = match account_id {
@@ -604,7 +641,7 @@ fn prune(
 ) -> Result<()> {
     // Pruning and syncing must not touch the same mirror at once.
     let _lock = if dry_run { None } else { Some(sync::lock()?) };
-    let root = db::root(conn)?;
+    let root = settings::root(conn)?;
     let providers = db::providers(conn)?;
     let host_of = |id: i64| {
         providers
@@ -711,7 +748,7 @@ fn prune(
 
 /// Explains every git repository under the root that weir does not manage.
 fn doctor(conn: &Connection, as_json: bool) -> Result<()> {
-    let root = db::root(conn)?;
+    let root = settings::root(conn)?;
     let reports = stray::classify(conn, &root, &stray::scan(conn, &root)?)?;
     if as_json {
         let out: Vec<_> = reports
@@ -754,8 +791,54 @@ fn doctor(conn: &Connection, as_json: bool) -> Result<()> {
 
 // ------------------------------------------------------------- reporting
 
-fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> {
+/// Whether syncs are keeping up: the last success, and the recent record.
+struct Health {
+    last_ok_at: Option<String>,
+    /// Hours since the last successful sync, when that is longer than allowed.
+    stale_hours: Option<i64>,
+    limit_hours: u64,
+    recent_ok: usize,
+    recent_bad: usize,
+}
+
+fn health(conn: &Connection) -> Result<Health> {
+    let limit_hours = settings::number(conn, "stale_after_hours")?;
+    let last_ok_at: Option<String> = conn
+        .query_row(
+            "SELECT finished_at FROM sync_runs WHERE ok = 1 ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    // With no success yet, the clock starts at the first attempt.
+    let first_attempt: Option<String> = conn
+        .query_row("SELECT MIN(started_at) FROM sync_runs", [], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let since = last_ok_at
+        .as_deref()
+        .or(first_attempt.as_deref())
+        .and_then(util::parse_utc);
+    let stale_hours = since
+        .map(|t| (util::unix_now() - t) / 3_600)
+        .filter(|hours| limit_hours > 0 && *hours >= limit_hours as i64);
+    let recent: Vec<runs::RunRow> = runs::latest(conn, 8)?
+        .into_iter()
+        .filter(|r| r.verdict() != "unfinished")
+        .take(7)
+        .collect();
+    Ok(Health {
+        last_ok_at,
+        stale_hours,
+        limit_hours,
+        recent_ok: recent.iter().filter(|r| r.verdict() == "ok").count(),
+        recent_bad: recent.iter().filter(|r| r.verdict() != "ok").count(),
+    })
+}
+
+fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<i32> {
     let scope = target::resolve(conn, target)?;
+    let root = settings::root(conn)?;
     let providers = db::providers(conn)?;
     let host_of = |id: i64| {
         providers
@@ -785,54 +868,81 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
         .filter(|r| PRUNABLE.contains(&r.state.as_str()))
         .count();
     let inaccessible = repos.iter().filter(|r| r.state == "inaccessible").count();
-    let unmanaged = stray::scan(conn, &db::root(conn)?)?.len();
-    let last: Option<(String, Option<i64>, Option<String>)> = conn
-        .query_row(
-            "SELECT started_at, seconds, summary FROM sync_runs ORDER BY id DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
+    let unmanaged = stray::scan(conn, &root)?.len();
+    let running = watch::running(conn)?;
+    let last = runs::latest(conn, 2)?
+        .into_iter()
+        .find(|r| running.as_ref().is_none_or(|live| live.id != r.id));
+    let health = health(conn)?;
+    let code = if health.stale_hours.is_some() { 1 } else { 0 };
 
-    let tracked_rows: Vec<_> = tracked
+    struct TrackedLine {
+        name: String,
+        account: Option<String>,
+        repos: usize,
+        pending: usize,
+        archived: usize,
+        max_size_mb: Option<i64>,
+    }
+    let tracked_lines: Vec<TrackedLine> = tracked
         .iter()
         .map(|t| {
-            let mine: Vec<&db::RepoRow> = repos
-                .iter()
-                .filter(|r| r.tracked_id == Some(t.id) && r.state == "active")
-                .collect();
-            let pending = mine.iter().filter(|r| r.last_result.is_none()).count();
-            let archived = repos
-                .iter()
-                .filter(|r| r.tracked_id == Some(t.id) && r.state == "archived")
-                .count();
-            let name = if t.repo.is_empty() {
-                format!("{}/{}", host_of(t.provider_id), t.owner)
-            } else {
-                format!("{}/{}/{}", host_of(t.provider_id), t.owner, t.repo)
+            let mine = |state: &str| -> Vec<&db::RepoRow> {
+                repos
+                    .iter()
+                    .filter(|r| r.tracked_id == Some(t.id) && r.state == state)
+                    .collect()
             };
-            let account = t
-                .account_id
-                .and_then(|id| accounts.iter().find(|a| a.id == id))
-                .map(|a| a.name.clone());
-            (name, account, mine.len(), pending, archived)
+            let active = mine("active");
+            TrackedLine {
+                name: if t.repo.is_empty() {
+                    format!("{}/{}", host_of(t.provider_id), t.owner)
+                } else {
+                    format!("{}/{}/{}", host_of(t.provider_id), t.owner, t.repo)
+                },
+                account: t
+                    .account_id
+                    .and_then(|id| accounts.iter().find(|a| a.id == id))
+                    .map(|a| a.name.clone()),
+                repos: active.len(),
+                pending: active.iter().filter(|r| r.last_result.is_none()).count(),
+                archived: mine("archived").len(),
+                max_size_mb: t.max_size_mb,
+            }
         })
         .collect();
 
     if as_json {
         let out = json!({
-            "root": db::root(conn)?,
+            "root": root,
             "accounts": accounts.iter().map(|a| json!({
                 "name": a.name, "host": host_of(a.provider_id), "login": a.login,
             })).collect::<Vec<_>>(),
-            "tracked": tracked_rows.iter().map(|(name, account, count, pending, archived)| json!({
-                "target": name, "account": account, "repos": count, "not_synced": pending,
-                "archived": archived,
+            "tracked": tracked_lines.iter().map(|t| json!({
+                "target": t.name, "account": t.account, "repos": t.repos,
+                "not_synced": t.pending, "archived": t.archived, "max_size_mb": t.max_size_mb,
             })).collect::<Vec<_>>(),
-            "last_sync": last.as_ref().map(|(at, secs, summary)| json!({
-                "started_at": at, "seconds": secs,
-                "summary": summary.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            "running": match &running {
+                Some(run) => json!({
+                    "run_id": run.id, "started_at": run.started_at, "phase": run.phase,
+                    "done": run.done, "planned": run.planned,
+                    "counts": runs::live_counts(conn, run)?,
+                    "current": run.current().iter().map(|(repo, seconds)| json!({
+                        "repo": repo, "seconds": seconds,
+                    })).collect::<Vec<_>>(),
+                }),
+                None => serde_json::Value::Null,
+            },
+            "last_sync": last.as_ref().map(|run| json!({
+                "run_id": run.id, "started_at": run.started_at, "finished_at": run.finished_at,
+                "seconds": run.seconds, "result": run.verdict(), "counts": run.counts(),
+                "problems": run.problems(),
             })),
+            "health": {
+                "last_ok_at": health.last_ok_at, "stale": health.stale_hours.is_some(),
+                "stale_after_hours": health.limit_hours,
+                "recent_ok": health.recent_ok, "recent_with_problems": health.recent_bad,
+            },
             "needs_attention": attention.iter().map(|r| json!({
                 "repo": format!("{}/{}/{}", host_of(r.provider_id), r.owner, r.name),
                 "result": r.last_result, "message": r.last_message,
@@ -842,10 +952,10 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
             "unmanaged": unmanaged,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
+        return Ok(code);
     }
 
-    println!("Mirrors in {}", db::root(conn)?.display());
+    println!("Mirrors in {}", root.display());
     println!("\nAccounts");
     if accounts.is_empty() {
         println!("  none; add one with `weir auth login <host>`");
@@ -859,40 +969,87 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
         );
     }
     println!("\nTracked");
-    if tracked_rows.is_empty() {
+    if tracked_lines.is_empty() {
         println!("  nothing; start with `weir track <host>/<owner>`");
     }
-    for (name, account, count, pending, archived) in &tracked_rows {
-        let mut line = format!("  {name:<40} {count} repos");
-        if *archived > 0 {
-            line.push_str(&format!(" (+{archived} archived)"));
+    for t in &tracked_lines {
+        let mut line = format!("  {:<40} {} repos", t.name, t.repos);
+        if t.archived > 0 {
+            line.push_str(&format!(" (+{} archived)", t.archived));
         }
-        if let Some(a) = account {
+        if let Some(a) = &t.account {
             line.push_str(&format!(", account {a}"));
         }
-        if *pending > 0 {
-            line.push_str(&format!(", {pending} not synced yet"));
+        if let Some(mb) = t.max_size_mb {
+            line.push_str(&format!(", up to {mb} MB each"));
+        }
+        if t.pending > 0 {
+            line.push_str(&format!(", {} not synced yet", t.pending));
         }
         println!("{line}");
     }
+
+    println!();
+    if let Some(run) = &running {
+        println!("Sync running: {}", watch::progress(conn, run)?);
+    }
+    let ago = |at: &str| {
+        util::parse_utc(at)
+            .map(|t| format!(" ({} ago)", util::ago(util::unix_now() - t)))
+            .unwrap_or_default()
+    };
     match &last {
-        Some((at, secs, summary)) => {
-            let counts: std::collections::BTreeMap<String, usize> = summary
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .and_then(|v| v.as_object().cloned())
-                .map(|o| {
-                    o.into_iter()
-                        .filter_map(|(k, v)| v.as_u64().map(|n| (k, n as usize)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            match secs {
-                Some(s) => println!("\nLast sync {at}, took {s}s: {}", sync::summarize(&counts)),
-                None => println!("\nLast sync {at} did not finish"),
-            }
+        Some(run) => match run.verdict() {
+            "ok" | "problems" => println!(
+                "Last sync {}{}, took {}s: {}",
+                run.started_at,
+                ago(&run.started_at),
+                run.seconds.unwrap_or(0),
+                sync::summarize(&run.counts())
+            ),
+            "failed" => println!(
+                "Last sync {}{} could not run: {}",
+                run.started_at,
+                ago(&run.started_at),
+                run.problems().join("; ")
+            ),
+            _ => println!(
+                "Last sync {}{} was interrupted before it finished.",
+                run.started_at,
+                ago(&run.started_at)
+            ),
+        },
+        None if running.is_none() => println!("No sync has run yet."),
+        None => {}
+    }
+    if let Some(run) = &last {
+        for p in run
+            .problems()
+            .iter()
+            .filter(|_| run.verdict() == "problems")
+        {
+            println!("  problem: {p}");
         }
-        None => println!("\nNo sync has run yet."),
+    }
+    if health.recent_ok + health.recent_bad > 1 {
+        println!(
+            "Last {} runs: {} ok, {} with problems",
+            health.recent_ok + health.recent_bad,
+            health.recent_ok,
+            health.recent_bad
+        );
+    }
+    if let Some(hours) = health.stale_hours {
+        match &health.last_ok_at {
+            Some(at) => println!(
+                "\nWARNING: no sync has succeeded since {at} ({hours}h ago; the limit is {}h).",
+                health.limit_hours
+            ),
+            None => println!(
+                "\nWARNING: no sync has succeeded yet, {hours}h after the first attempt (the limit is {}h).",
+                health.limit_hours
+            ),
+        }
     }
     if !attention.is_empty() {
         println!("\nNeeds attention");
@@ -922,7 +1079,7 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
             "\n{unmanaged} git repositories under the root are not managed by weir; `weir doctor` explains them."
         );
     }
-    Ok(())
+    Ok(code)
 }
 
 fn list(
@@ -933,7 +1090,7 @@ fn list(
     as_json: bool,
 ) -> Result<()> {
     let scope = target::resolve(conn, target)?;
-    let root = db::root(conn)?;
+    let root = settings::root(conn)?;
     let providers = db::providers(conn)?;
     let mut out = Vec::new();
     for r in db::repos(conn, "1 = 1", &[])? {
@@ -976,7 +1133,7 @@ fn path(conn: &Connection, repo: &str) -> Result<()> {
         [r.provider_id],
         |row| row.get(0),
     )?;
-    let dir = sync::path_of(&db::root(conn)?, &host, &r);
+    let dir = sync::path_of(&settings::root(conn)?, &host, &r);
     if !dir.exists() {
         bail!(
             "{host}/{}/{} has not been synced yet; run `weir sync`",
@@ -988,46 +1145,52 @@ fn path(conn: &Connection, repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn log(conn: &Connection, count: usize, as_json: bool) -> Result<()> {
-    let mut runs = conn.prepare(
-        "SELECT id, started_at, seconds, summary FROM sync_runs ORDER BY id DESC LIMIT ?1",
-    )?;
-    let runs: Vec<(i64, String, Option<i64>, Option<String>)> = runs
-        .query_map([count as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut events = conn.prepare(
-        "SELECT action, repo, old_head, new_head, message FROM repo_syncs WHERE run_id = ?1 ORDER BY id",
-    )?;
+fn log(conn: &Connection, count: usize, all: bool, slow: bool, as_json: bool) -> Result<()> {
+    let runs = runs::latest(conn, count)?;
     let mut out = Vec::new();
-    for (id, started, seconds, summary) in &runs {
-        let changes: Vec<sync::Event> = events
-            .query_map([id], |r| {
-                Ok(sync::Event {
-                    action: r.get(0)?,
-                    repo: r.get(1)?,
-                    repo_id: None,
-                    old_head: r.get(2)?,
-                    new_head: r.get(3)?,
-                    message: r.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+    for run in &runs {
+        let mut changes: Vec<sync::Event> = runs::events(conn, run.id, 0)?
+            .into_iter()
+            .map(|(_, e)| e)
+            .filter(|e| all || slow || e.action != "unchanged")
+            .collect();
+        if slow {
+            changes.sort_by_key(|e| std::cmp::Reverse(e.millis.unwrap_or(0)));
+            changes.truncate(10);
+        }
         if as_json {
             out.push(json!({
-                "run_id": id, "started_at": started, "seconds": seconds,
-                "summary": summary.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+                "run_id": run.id, "started_at": run.started_at, "finished_at": run.finished_at,
+                "seconds": run.seconds, "listing_seconds": run.listing_seconds,
+                "result": run.verdict(), "counts": run.counts(), "problems": run.problems(),
                 "changes": changes,
             }));
             continue;
         }
-        match seconds {
-            Some(s) => println!("run {id}  {started}  {s}s  {} change(s)", changes.len()),
-            None => println!("run {id}  {started}  did not finish"),
+        let mut header = format!("run {}  {}  {}", run.id, run.started_at, run.verdict());
+        if let Some(s) = run.seconds {
+            header.push_str(&format!("  {s}s"));
+            if let Some(listing) = run.listing_seconds {
+                header.push_str(&format!(" ({listing}s listing)"));
+            }
+        }
+        if run.finished_at.is_some() && run.verdict() != "interrupted" {
+            header.push_str(&format!("  {}", sync::summarize(&run.counts())));
+        }
+        println!("{header}");
+        for p in run.problems() {
+            println!("  problem   {p}");
         }
         for e in &changes {
-            println!("  {}", sync::describe(e));
+            if slow {
+                println!(
+                    "  {:>7.1}s  {}",
+                    e.millis.unwrap_or(0) as f64 / 1000.0,
+                    sync::describe(e)
+                );
+            } else {
+                println!("  {}", sync::describe(e));
+            }
         }
     }
     if as_json {
@@ -1070,24 +1233,43 @@ fn provider_add(conn: &Connection, kind: &str, host: &str, api_url: Option<Strin
     Ok(())
 }
 
+fn config_list(conn: &Connection, as_json: bool) -> Result<()> {
+    if as_json {
+        let mut out = serde_json::Map::new();
+        for s in &settings::SETTINGS {
+            out.insert(s.key.to_string(), json!(settings::get(conn, s.key)?));
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    for s in &settings::SETTINGS {
+        let value = settings::get(conn, s.key)?;
+        let shown = if value.is_empty() {
+            "(not set)"
+        } else {
+            &value
+        };
+        println!("{:<18} {shown}", s.key);
+        println!("{:<18} {}", "", s.help);
+    }
+    Ok(())
+}
+
 fn config_get(conn: &Connection, key: &str) -> Result<()> {
-    match key {
-        "root" => println!("{}", db::root(conn)?.display()),
-        other => bail!("unknown setting {other:?}; the only setting is `root`"),
+    if key == "root" {
+        println!("{}", settings::root(conn)?.display());
+    } else {
+        println!("{}", settings::get(conn, key)?);
     }
     Ok(())
 }
 
 fn config_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    match key {
-        "root" => {
-            if value.trim().is_empty() {
-                bail!("root cannot be empty");
-            }
-            db::config_set(conn, "root", value)?;
-            println!("Mirrors now live in {}.", db::root(conn)?.display());
-        }
-        other => bail!("unknown setting {other:?}; the only setting is `root`"),
+    settings::set(conn, key, value)?;
+    if key == "root" {
+        println!("Mirrors now live in {}.", settings::root(conn)?.display());
+    } else {
+        println!("{key} = {value}");
     }
     Ok(())
 }
