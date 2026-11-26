@@ -23,7 +23,7 @@ use secret::Source;
 #[derive(Parser)]
 #[command(
     name = "weir",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("WEIR_COMMIT"), ")"),
     about = "Keeps a set of repositories from a provider mirrored locally, read-only",
     disable_help_subcommand = true
 )]
@@ -249,7 +249,11 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     if let Cmd::Version = cli.cmd {
-        println!("weir {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "weir {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("WEIR_COMMIT")
+        );
         return Ok(0);
     }
     let conn = db::open()?;
