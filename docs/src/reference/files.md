@@ -7,9 +7,10 @@
 | Mirrors | `~/Repos/<host>/<owner>/<name>` | `weir config set root <dir>` |
 | Database: accounts, what is tracked, every repository, sync history | `~/.weir/weir.db` | the `WEIR_HOME` environment variable |
 | Log of every change, one line each | `~/.weir/weir.log` | `WEIR_HOME` |
-| The daemon's own notes | `~/.weir/daemon.log` | `WEIR_HOME` |
+| The daemon's own notes | `$(brew --prefix)/var/log/weir.log` with Homebrew, `~/.weir/daemon.log` otherwise | |
 | Tokens | the Keychain, an environment variable or a command | `weir auth login` |
-| The background service | `~/Library/LaunchAgents/dev.weir.daemon.plist` on macOS, `~/.config/systemd/user/weir.service` on Linux | `weir service install` and `uninstall` |
+| The background service, with Homebrew | `~/Library/LaunchAgents/sh.brew.weir.plist` on macOS, `~/.config/systemd/user/sh.brew.weir.service` on Linux (older Homebrew versions name them `homebrew.mxcl.weir.plist` and `homebrew.weir.service`) | `brew services start` and `stop` |
+| The background service, without Homebrew | `~/Library/LaunchAgents/dev.weir.daemon.plist` on macOS, `~/.config/systemd/user/weir.service` on Linux | `weir service install` and `uninstall` |
 
 The database is a single SQLite file. Deleting it loses weir's memory, not your mirrors: track the
 same owners again and the next sync adopts what is on disk.

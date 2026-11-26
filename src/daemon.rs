@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -130,6 +131,30 @@ pub fn on_battery() -> bool {
     }
 }
 
+/// The file the daemon is running from: its path resolved through links,
+/// which file on disk that is, and when it was last written. An upgrade
+/// changes at least one of them, whether it swaps a link (Homebrew), puts a
+/// new file in place, or rewrites the old one.
+type Binary = (PathBuf, u64, Option<SystemTime>);
+
+fn binary_now(launch: &Path) -> Option<Binary> {
+    use std::os::unix::fs::MetadataExt;
+    let resolved = std::fs::canonicalize(launch).ok()?;
+    let meta = std::fs::metadata(&resolved).ok()?;
+    Some((resolved, meta.ino(), meta.modified().ok()))
+}
+
+/// The path the daemon was started with. A service manager starts it through
+/// a stable path (Homebrew's is a link to the current version), which is what
+/// has to be watched; a bare name from a shell is resolved once.
+fn launch_path() -> Option<PathBuf> {
+    std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::current_exe().ok())
+}
+
 pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
     let lock = lock_file()?;
     match lock.try_lock() {
@@ -153,12 +178,20 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
         params![std::process::id(), util::now()],
     )?;
     note("weir daemon started");
+    let launch = launch_path();
+    let started_from = launch.as_deref().and_then(binary_now);
 
     let mut failures = 0u32;
     let mut cycles = 0u64;
     let mut was_offline = false;
     let mut was_paused = false;
     while !stop.load(Ordering::Relaxed) {
+        // An upgrade replaced the binary: step aside, and the service manager
+        // starts the new version. Upgrading does not restart a service.
+        if started_from.is_some() && launch.as_deref().and_then(binary_now) != started_from {
+            note("weir was replaced by another version; exiting so the service starts it");
+            break;
+        }
         // Settings are read every cycle, so changing one needs no restart.
         let interval = match o.interval {
             Some(secs) => secs,

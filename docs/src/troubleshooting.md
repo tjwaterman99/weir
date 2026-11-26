@@ -86,8 +86,10 @@ fetches it regardless of what the provider's listing says.
 weir service status
 ```
 
-says whether the service is installed and the daemon alive. `~/.weir/daemon.log` has the daemon's
-own notes. If its token comes from a command, check that the command uses a full path; a service's
+says whether a service is installed, who manages it, and whether the daemon is alive. With
+Homebrew, `brew services info weir` gives launchd's or systemd's view, and
+`brew services restart weir` starts it again. The daemon's own notes are in
+`$(brew --prefix)/var/log/weir.log` under Homebrew and `~/.weir/daemon.log` otherwise. If its token comes from a command, check that the command uses a full path; a service's
 `PATH` is shorter than your shell's.
 
 ## `weir status` warns that no sync has succeeded

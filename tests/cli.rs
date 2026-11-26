@@ -1408,6 +1408,32 @@ fn daemon_keeps_mirrors_current_until_stopped() {
     assert!(notes.contains("weir daemon stopped"), "{notes}");
     assert!(!env.ok(&["status"]).stdout.contains("Daemon running"));
     assert_eq!(env.weir(&["service", "status"]).code, 1);
+    // A service that Homebrew registered is recognized, and weir will not
+    // register a second one next to it.
+    let brew_service = env.p("userhome").join(if cfg!(target_os = "macos") {
+        "Library/LaunchAgents/sh.brew.weir.plist"
+    } else {
+        ".config/systemd/user/sh.brew.weir.service"
+    });
+    std::fs::create_dir_all(brew_service.parent().unwrap()).unwrap();
+    std::fs::write(&brew_service, "").unwrap();
+    let status = env.weir(&["service", "status"]);
+    assert!(
+        status.stdout.contains("Service managed by Homebrew"),
+        "{}",
+        status.stdout
+    );
+    let refused = env.weir(&["service", "install"]);
+    assert_eq!(refused.code, 2);
+    assert!(
+        refused.stderr.contains("brew services start weir"),
+        "{}",
+        refused.stderr
+    );
+    assert!(env
+        .ok(&["status"])
+        .stdout
+        .contains("`brew services start weir` starts it"));
     env.assert_mirror("acme", "app");
     env.assert_mirror("acme", "new");
 }
@@ -1705,4 +1731,53 @@ fn command_reference_is_up_to_date() {
             "docs/src/SUMMARY.md does not list reference/commands/{name}"
         );
     }
+}
+
+#[test]
+fn daemon_steps_aside_when_its_binary_is_replaced() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+
+    // Run a copy of the binary, the way a service manager runs an installed one.
+    let installed = env.p("bin").join("weir");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_weir"), &installed).unwrap();
+    let mut c = Command::new(&installed);
+    env.isolate(&mut c);
+    let child = c
+        .args(["daemon", "--interval", "1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("the first clone", &|| {
+        env.mirror("acme", "app").join(".git").is_dir()
+    });
+
+    // An upgrade puts a new file where the old one was.
+    let staged = env.p("bin").join("weir.new");
+    std::fs::copy(env!("CARGO_BIN_EXE_weir"), &staged).unwrap();
+    std::fs::rename(&staged, &installed).unwrap();
+
+    // It exits on its own, cleanly, so the service manager can start the new one.
+    // Polled, so a daemon that never exits fails the test instead of hanging it.
+    let mut child = child;
+    let mut exited = false;
+    for _ in 0..150 {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !exited {
+        child.kill().unwrap();
+        panic!("the daemon kept running after its binary was replaced");
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+    let notes = String::from_utf8_lossy(&out.stderr);
+    assert!(notes.contains("replaced by another version"), "{notes}");
+    assert!(!env.ok(&["status"]).stdout.contains("Daemon running"));
 }
