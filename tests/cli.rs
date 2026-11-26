@@ -883,6 +883,177 @@ fn doctor_explains_unmanaged_clones_and_prune_removes_only_duplicates() {
     env.assert_mirror("acme", "app");
 }
 
+fn db(env: &Env) -> rusqlite::Connection {
+    rusqlite::Connection::open(env.p("home").join("weir.db")).unwrap()
+}
+
+#[test]
+fn status_warns_when_syncs_stop_succeeding() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["sync"]);
+    env.ok(&["sync"]);
+    let fresh = env.ok(&["status"]);
+    assert!(
+        fresh.stdout.contains("Last 2 runs: 2 ok, 0 with problems"),
+        "{}",
+        fresh.stdout
+    );
+    assert!(!fresh.stdout.contains("WARNING"), "{}", fresh.stdout);
+
+    // Pretend the last success was long ago.
+    db(&env)
+        .execute(
+            "UPDATE sync_runs SET started_at = '2020-01-01T08:30:00Z', finished_at = '2020-01-01T08:31:00Z'",
+            [],
+        )
+        .unwrap();
+    let stale = env.weir(&["status"]);
+    assert_eq!(stale.code, 1, "{}", stale.stdout);
+    assert!(stale
+        .stdout
+        .contains("WARNING: no sync has succeeded since 2020-01-01T08:31:00Z"));
+    let json: serde_json::Value =
+        serde_json::from_str(&env.weir(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(json["health"]["stale"], true);
+
+    // The limit is a setting, and 0 turns the check off.
+    env.ok(&["config", "set", "stale_after_hours", "0"]);
+    assert_eq!(env.weir(&["status"]).code, 0);
+    env.ok(&["config", "unset", "stale_after_hours"]);
+    assert_eq!(env.weir(&["status"]).code, 1);
+    assert!(env
+        .ok(&["config", "list"])
+        .stdout
+        .contains("stale_after_hours  36"));
+    assert_eq!(env.weir(&["config", "set", "nope", "1"]).code, 2);
+    assert_eq!(
+        env.weir(&["config", "set", "stale_after_hours", "soon"])
+            .code,
+        2
+    );
+
+    // A run that died is reported as interrupted, then recorded as such.
+    env.ok(&["sync"]);
+    db(&env)
+        .execute(
+            "INSERT INTO sync_runs (started_at, phase, pid) VALUES ('2026-01-01T00:00:00Z', 'syncing', 1)",
+            [],
+        )
+        .unwrap();
+    let dead = env.ok(&["status"]);
+    assert!(
+        dead.stdout.contains("was interrupted before it finished"),
+        "{}",
+        dead.stdout
+    );
+    assert!(!dead.stdout.contains("Sync running"), "{}", dead.stdout);
+    env.ok(&["sync"]);
+    assert!(env.ok(&["log"]).stdout.contains("interrupted"));
+}
+
+#[test]
+fn sync_streams_json_and_records_timings() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    env.make_repo("acme", "lib");
+    env.ok(&["track", "local.test/acme"]);
+
+    let run = env.ok(&["sync", "--json"]);
+    let events: Vec<serde_json::Value> = run
+        .stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l}: {e}")))
+        .collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["start", "plan", "repo", "repo", "finish"]);
+    assert_eq!(events[1]["jobs"], 2);
+    assert_eq!(events[2]["action"], "cloned");
+    assert!(events[2]["millis"].as_i64().unwrap() >= 0);
+    assert_eq!(events[4]["ok"], true);
+    assert_eq!(events[4]["counts"]["cloned"], 2);
+
+    // Repositories that were fetched and had not changed are recorded too.
+    env.ok(&["sync", "--all"]);
+    assert!(!env
+        .ok(&["log", "-n", "1"])
+        .stdout
+        .contains("unchanged local.test/acme/app"));
+    assert!(env
+        .ok(&["log", "-n", "1", "--all"])
+        .stdout
+        .contains("unchanged local.test/acme/app"));
+    let slow = env.ok(&["log", "--slow"]).stdout;
+    assert!(slow.contains("s  cloned    local.test/acme/"), "{slow}");
+
+    // The log file keeps a readable trail of every run.
+    let trail = std::fs::read_to_string(env.p("home").join("weir.log")).unwrap();
+    assert!(
+        trail.contains("run 1  cloned    local.test/acme/app"),
+        "{trail}"
+    );
+    assert!(trail.contains("run 2  finished: 2 unchanged"), "{trail}");
+}
+
+#[test]
+fn runs_a_command_when_a_sync_has_problems() {
+    let env = Env::new();
+    let app = env.make_repo("acme", "app");
+    env.make_repo("acme", "other");
+    env.ok(&["track", "local.test/acme"]);
+    let note = env.p("note.txt");
+    let summary = env.p("summary.txt");
+    env.ok(&[
+        "config",
+        "set",
+        "on_problem",
+        &format!(
+            "cat > {}; printf %s \"$WEIR_SUMMARY\" > {}",
+            note.display(),
+            summary.display()
+        ),
+    ]);
+
+    env.ok(&["sync"]);
+    assert!(!note.exists(), "a clean sync must not run the command");
+
+    // Make one mirror impossible to update.
+    let file = env.mirror("acme", "app").join("README.md");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&file, "my edit\n").unwrap();
+    env.push("acme", "app", "README.md", "two\n");
+    let _ = app;
+    assert_eq!(env.weir(&["sync"]).code, 1);
+    let told = std::fs::read_to_string(&note).unwrap();
+    assert!(told.contains("skipped   local.test/acme/app"), "{told}");
+    assert_eq!(
+        std::fs::read_to_string(&summary).unwrap(),
+        "1 skipped, 1 unchanged"
+    );
+}
+
+#[test]
+fn skips_repositories_over_the_size_limit() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    let big = env.make_repo("acme", "big");
+    std::fs::write(big.join("weir-size"), "2048000\n").unwrap();
+    assert_eq!(
+        env.weir(&["track", "local.test/acme", "--max-size", "0"])
+            .code,
+        2
+    );
+    env.ok(&["track", "local.test/acme", "--max-size", "500"]);
+    env.ok(&["sync"]);
+    assert!(!env.mirror("acme", "big").exists());
+    assert_eq!(env.ok(&["list"]).stdout.trim(), "local.test/acme/app");
+    assert!(env.ok(&["status"]).stdout.contains("up to 500 MB each"));
+}
+
 #[test]
 fn only_one_sync_runs_at_a_time() {
     let env = Env::new();
@@ -1092,4 +1263,71 @@ fn github_accounts_paging_and_credentials() {
         2,
         "still tracking acme"
     );
+}
+
+#[test]
+fn status_and_watch_follow_a_sync_in_progress() {
+    let env = Env::new();
+    let a = env.make_repo("acme", "a");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    serve(listener, move |path, token| match (path, token) {
+        ("/user", "tok") => (200, None, r#"{"login":"worker","id":1}"#.into()),
+        ("/users/acme", "tok") => (
+            200,
+            None,
+            r#"{"login":"acme","id":9,"type":"Organization"}"#.into(),
+        ),
+        ("/orgs/acme/repos?type=all&per_page=100", "tok") => (
+            200,
+            None,
+            format!("[{}]", gh_repo(1, "acme", "a", &a, "t1")),
+        ),
+        _ => (401, None, r#"{"message":"Bad credentials"}"#.to_string()),
+    });
+    env.ok(&["provider", "add", "github", "ghe.test", "--api-url", &base]);
+    // A token that takes three seconds to fetch keeps the sync in its listing phase.
+    env.ok(&[
+        "auth",
+        "login",
+        "ghe.test",
+        "--name",
+        "work",
+        "--command",
+        "sleep 3; echo tok",
+    ]);
+    env.ok(&["track", "ghe.test/acme"]);
+
+    std::thread::scope(|s| {
+        let sync = s.spawn(|| env.weir(&["sync"]));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        let status = env.weir(&["status"]);
+        assert!(
+            status.stdout.contains("Sync running: listing repositories"),
+            "{}",
+            status.stdout
+        );
+        let second = env.weir(&["sync"]);
+        assert_eq!(second.code, 2, "{}", second.stderr);
+
+        // Attached from "another terminal": it sees the rest of the run and its result.
+        let watched = env.weir(&["watch"]);
+        assert_eq!(watched.code, 0, "{}{}", watched.stdout, watched.stderr);
+        assert!(
+            watched.stdout.contains("cloned    ghe.test/acme/a"),
+            "{}",
+            watched.stdout
+        );
+        assert!(
+            watched.stdout.contains("weir: 1 cloned in"),
+            "{}",
+            watched.stdout
+        );
+
+        let done = sync.join().unwrap();
+        assert_eq!(done.code, 0, "{}{}", done.stdout, done.stderr);
+    });
+    assert!(env.ok(&["watch"]).stdout.contains("No sync is running."));
+    assert!(!env.ok(&["status"]).stdout.contains("Sync running"));
 }

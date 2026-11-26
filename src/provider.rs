@@ -23,6 +23,8 @@ pub struct RemoteRepo {
     pub pushed_at: Option<String>,
     pub fork: bool,
     pub archived: bool,
+    /// Size in kilobytes, when the provider reports one.
+    pub size_kb: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +129,7 @@ struct GhRepo {
     fork: bool,
     #[serde(default)]
     archived: bool,
+    size: Option<u64>,
 }
 
 impl From<GhRepo> for RemoteRepo {
@@ -140,6 +143,7 @@ impl From<GhRepo> for RemoteRepo {
             pushed_at: r.pushed_at,
             fork: r.fork,
             archived: r.archived,
+            size_kb: r.size,
         }
     }
 }
@@ -322,7 +326,7 @@ impl GitHub {
 /// suite runs against. It also works for repositories kept on a shared disk.
 /// Optional marker files inside a repository let tests imitate a real provider:
 /// `weir-id` (a stable id, so a rename is seen as a rename), `weir-archived`,
-/// `weir-fork`, `weir-old-names` (one `owner/name` per line that redirects
+/// `weir-fork`, `weir-size` (kilobytes), `weir-old-names` (one `owner/name` per line that redirects
 /// here), `weir-hidden` (exists but is not listed) and `weir-forbidden`
 /// (exists, not listed, and lookups are refused).
 pub struct Local {
@@ -350,6 +354,9 @@ impl Local {
             pushed_at: git::opt(Some(path), &["rev-parse", "-q", "--verify", "HEAD"]),
             fork: path.join("weir-fork").exists(),
             archived: path.join("weir-archived").exists(),
+            size_kb: std::fs::read_to_string(path.join("weir-size"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
             name,
         })
     }

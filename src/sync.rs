@@ -4,17 +4,20 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
+use std::io::{IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::db::{self, ProviderRow, RepoRow, TrackedRow};
-use crate::git::{self, Action, Job};
+use crate::git::{self, Job, Outcome};
 use crate::provider::{self, AuthError, Lookup, RemoteRepo};
 use crate::secret::Source;
+use crate::settings;
 use crate::stray;
 use crate::target;
 use crate::util;
@@ -39,6 +42,9 @@ pub struct Event {
     pub old_head: Option<String>,
     pub new_head: Option<String>,
     pub message: Option<String>,
+    /// How long the work on this repository took.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub millis: Option<i64>,
 }
 
 struct Plan {
@@ -49,36 +55,73 @@ struct Plan {
     unchanged: usize,
 }
 
-#[derive(Serialize)]
-struct Report<'a> {
-    run_id: Option<i64>,
-    dry_run: bool,
-    counts: &'a BTreeMap<String, usize>,
-    events: &'a [Event],
-    problems: &'a [String],
-}
+/// How many past runs are kept for `weir log`.
+const RUNS_KEPT: i64 = 500;
 
 /// Runs a sync and returns the process exit code.
 pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
-    let root = db::root(conn)?;
+    let root = settings::root(conn)?;
     let _lock = if o.dry_run { None } else { Some(lock()?) };
     let started = Instant::now();
 
+    let run_id = if o.dry_run {
+        None
+    } else {
+        // The lock is ours, so a run that never finished is one that died.
+        conn.execute(
+            "UPDATE sync_runs SET finished_at = ?1, phase = 'interrupted', ok = 0, current = NULL
+             WHERE finished_at IS NULL",
+            [util::now()],
+        )?;
+        conn.execute(
+            "DELETE FROM sync_runs WHERE id <= (SELECT MAX(id) FROM sync_runs) - ?1",
+            [RUNS_KEPT],
+        )?;
+        conn.execute(
+            "INSERT INTO sync_runs (started_at, phase, pid) VALUES (?1, 'listing', ?2)",
+            params![util::now(), std::process::id()],
+        )?;
+        Some(conn.last_insert_rowid())
+    };
+    let mut ui = Ui::new(o, run_id);
+    ui.begin();
+
     // Planning writes what the providers report into the database. A dry run
-    // rolls all of it back, so it leaves no trace.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let plan = match plan(conn, o, &root) {
+    // does it inside a transaction and rolls it back, so it leaves no trace.
+    if o.dry_run {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    let planned = plan(conn, o, &root, &mut ui);
+    if o.dry_run {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    let plan = match planned {
         Ok(p) => p,
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            ui.clear();
+            if let Some(id) = run_id {
+                conn.execute(
+                    "UPDATE sync_runs SET finished_at = ?1, seconds = ?2, phase = 'failed', ok = 0,
+                            summary = ?3
+                     WHERE id = ?4",
+                    params![
+                        util::now(),
+                        started.elapsed().as_secs() as i64,
+                        json!({ "problems": [format!("{e:#}")] }).to_string(),
+                        id
+                    ],
+                )?;
+            }
             return Err(e);
         }
     };
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut events = plan.events.clone();
+    let listing_seconds = started.elapsed().as_secs() as i64;
+    ui.planned(plan.jobs.len(), plan.unchanged);
 
-    if o.dry_run {
-        conn.execute_batch("ROLLBACK")?;
+    let Some(run_id) = run_id else {
+        for e in &plan.events {
+            ui.event(e);
+        }
         for job in &plan.jobs {
             let action = if !job.path.exists() && job.move_from.is_none() {
                 "clone"
@@ -89,34 +132,34 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
             } else {
                 "heal"
             };
-            events.push(Event {
+            ui.done += 1;
+            ui.event(&Event {
                 action: action.to_string(),
                 repo: job.repo.clone(),
                 repo_id: Some(job.repo_id),
                 old_head: None,
                 new_head: None,
                 message: None,
+                millis: None,
             });
         }
-        for e in &events {
-            *counts.entry(e.action.clone()).or_default() += 1;
-            emit(o, e);
-        }
-        counts.insert("unchanged".to_string(), plan.unchanged);
-        finish(o, None, true, &counts, &events, &plan.problems, started);
+        ui.finish(&plan.problems, true);
         return Ok(if plan.problems.is_empty() { 0 } else { 1 });
-    }
-    conn.execute_batch("COMMIT")?;
+    };
 
     conn.execute(
-        "INSERT INTO sync_runs (started_at) VALUES (?1)",
-        [util::now()],
+        "UPDATE sync_runs SET planned = ?1, unchanged = ?2, phase = 'syncing', listing_seconds = ?3
+         WHERE id = ?4",
+        params![
+            plan.jobs.len() as i64,
+            plan.unchanged as i64,
+            listing_seconds,
+            run_id
+        ],
     )?;
-    let run_id = conn.last_insert_rowid();
-    for e in &events {
+    for e in &plan.events {
         record_event(conn, run_id, e)?;
-        *counts.entry(e.action.clone()).or_default() += 1;
-        emit(o, e);
+        ui.event(e);
     }
 
     let pushed: HashMap<i64, (Option<String>, String, String, String)> =
@@ -125,6 +168,10 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
             .map(|r| (r.id, (r.pushed_at, r.default_branch, r.owner, r.name)))
             .collect();
 
+    enum Msg {
+        Started(String),
+        Done(Box<Job>, Outcome, i64),
+    }
     let queue = Mutex::new(plan.jobs.into_iter());
     let (tx, rx) = mpsc::channel();
     let workers = o.jobs.max(1);
@@ -136,14 +183,38 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
             s.spawn(move || loop {
                 let job = queue.lock().unwrap().next();
                 let Some(job) = job else { break };
+                let label = match job.size_kb {
+                    // Say how big a slow clone is, so it does not look stuck.
+                    Some(kb) if kb >= 512_000 && !job.path.exists() => {
+                        format!("{} ({})", job.repo, util::size(kb))
+                    }
+                    _ => job.repo.clone(),
+                };
+                let _ = tx.send(Msg::Started(label));
+                let began = Instant::now();
                 let outcome = git::sync_mirror(&job);
-                if tx.send((job, outcome)).is_err() {
+                let millis = began.elapsed().as_millis() as i64;
+                if tx.send(Msg::Done(Box::new(job), outcome, millis)).is_err() {
                     break;
                 }
             });
         }
         drop(tx);
-        for (job, outcome) in rx {
+        loop {
+            let (job, outcome, millis) = match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Msg::Started(label)) => {
+                    ui.current.push((label, Instant::now()));
+                    let _ = heartbeat(conn, run_id, &ui);
+                    ui.draw();
+                    continue;
+                }
+                Ok(Msg::Done(job, outcome, millis)) => (job, outcome, millis),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    ui.tick();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let event = Event {
                 action: outcome.action.as_str().to_string(),
                 repo: job.repo.clone(),
@@ -151,6 +222,7 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
                 old_head: outcome.old_head.clone(),
                 new_head: outcome.new_head.clone(),
                 message: outcome.message(),
+                millis: Some(millis),
             };
             let stored = (|| -> Result<()> {
                 let now = util::now();
@@ -178,66 +250,112 @@ pub fn run(conn: &Connection, o: &Opts) -> Result<i32> {
                         ],
                     )?;
                 }
-                if outcome.action != Action::Unchanged {
-                    record_event(conn, run_id, &event)?;
-                }
-                Ok(())
+                // Unchanged repositories are recorded too: their timings are
+                // what explains a slow sync.
+                record_event(conn, run_id, &event)
             })();
             if let Err(e) = stored {
                 failure.get_or_insert(e);
             }
-            *counts.entry(event.action.clone()).or_default() += 1;
-            if outcome.action != Action::Unchanged {
-                emit(o, &event);
-                events.push(event);
-            }
+            ui.current
+                .retain(|(label, _)| !label.starts_with(job.repo.as_str()));
+            ui.done += 1;
+            ui.event(&event);
+            let _ = heartbeat(conn, run_id, &ui);
         }
     });
     if let Some(e) = failure {
+        ui.clear();
         return Err(e.context("could not record sync results"));
     }
 
-    *counts.entry("unchanged".to_string()).or_default() += plan.unchanged;
-    let mut summary = serde_json::to_value(&counts)?;
-    summary["problems"] = serde_json::json!(plan.problems);
+    let bad = ui.count("failed") + ui.count("skipped");
+    let ok = bad == 0 && plan.problems.is_empty();
+    let mut summary = serde_json::to_value(&ui.counts)?;
+    summary["problems"] = json!(plan.problems);
     conn.execute(
-        "UPDATE sync_runs SET finished_at = ?1, seconds = ?2, summary = ?3 WHERE id = ?4",
+        "UPDATE sync_runs SET finished_at = ?1, seconds = ?2, summary = ?3, ok = ?4,
+                phase = 'done', current = NULL, done = ?5
+         WHERE id = ?6",
         params![
             util::now(),
             started.elapsed().as_secs() as i64,
             summary.to_string(),
+            ok,
+            ui.done as i64,
             run_id
         ],
     )?;
-    finish(
-        o,
-        Some(run_id),
-        false,
-        &counts,
-        &events,
-        &plan.problems,
-        started,
-    );
-
-    let bad =
-        counts.get("failed").copied().unwrap_or(0) + counts.get("skipped").copied().unwrap_or(0);
-    Ok(if bad > 0 || !plan.problems.is_empty() {
-        1
-    } else {
-        0
-    })
+    ui.finish(&plan.problems, false);
+    if !ok {
+        on_problem(conn, run_id, &ui, &plan.problems);
+    }
+    Ok(if ok { 0 } else { 1 })
 }
 
-fn record_event(conn: &Connection, run_id: i64, e: &Event) -> Result<()> {
+/// Writes how far the run has got, for `weir status` and `weir watch`.
+fn heartbeat(conn: &Connection, run_id: i64, ui: &Ui) -> Result<()> {
+    let now = Instant::now();
+    let current: Vec<serde_json::Value> = ui
+        .current
+        .iter()
+        .map(|(label, since)| json!({ "repo": label, "seconds": (now - *since).as_secs() }))
+        .collect();
     conn.execute(
-        "INSERT INTO repo_syncs (run_id, repo_id, repo, action, old_head, new_head, message)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![run_id, e.repo_id, e.repo, e.action, e.old_head, e.new_head, e.message],
+        "UPDATE sync_runs SET done = ?1, current = ?2 WHERE id = ?3",
+        params![ui.done as i64, json!(current).to_string(), run_id],
     )?;
     Ok(())
 }
 
-/// Formats an event the way `sync` and `log` both print it.
+/// Runs the user's `on_problem` command, if one is set. Its failure is
+/// reported and otherwise ignored: it must never turn a sync into an error.
+fn on_problem(conn: &Connection, run_id: i64, ui: &Ui, problems: &[String]) {
+    let Ok(command) = settings::get(conn, "on_problem") else {
+        return;
+    };
+    if command.trim().is_empty() {
+        return;
+    }
+    let mut details: Vec<String> = problems.to_vec();
+    details.extend(ui.trouble.iter().cloned());
+    let summary = summarize(&ui.counts);
+    let text = format!("weir sync: {summary}\n{}\n", details.join("\n"));
+    let spawned = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .env("WEIR_RUN_ID", run_id.to_string())
+        .env("WEIR_SUMMARY", &summary)
+        .env("WEIR_PROBLEMS", details.join("\n"))
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!("weir: the on_problem command exited with {status}"),
+                Err(e) => eprintln!("weir: the on_problem command failed: {e}"),
+            }
+        }
+        Err(e) => eprintln!("weir: could not run the on_problem command: {e}"),
+    }
+}
+
+fn record_event(conn: &Connection, run_id: i64, e: &Event) -> Result<()> {
+    conn.execute(
+        "INSERT INTO repo_syncs (run_id, repo_id, repo, action, old_head, new_head, message, millis)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            run_id, e.repo_id, e.repo, e.action, e.old_head, e.new_head, e.message, e.millis
+        ],
+    )?;
+    Ok(())
+}
+
+/// Formats an event the way `sync`, `watch` and `log` all print it.
 pub fn describe(e: &Event) -> String {
     let mut line = format!("{:<9} {}", e.action, e.repo);
     if let (Some(old), Some(new)) = (&e.old_head, &e.new_head) {
@@ -249,18 +367,6 @@ pub fn describe(e: &Event) -> String {
         line.push_str(&format!("  ({m})"));
     }
     line
-}
-
-fn emit(o: &Opts, e: &Event) {
-    if o.json {
-        return;
-    }
-    let problem = e.action == "failed" || e.action == "skipped";
-    if problem {
-        eprintln!("{}", describe(e));
-    } else if !o.quiet {
-        println!("{}", describe(e));
-    }
 }
 
 /// Counts as a sentence fragment: `3 cloned, 12 updated, 780 unchanged`.
@@ -301,54 +407,287 @@ pub fn summarize(counts: &BTreeMap<String, usize>) -> String {
     }
 }
 
-fn finish(
-    o: &Opts,
-    run_id: Option<i64>,
-    dry_run: bool,
+/// The status line shown while a sync runs: how far along, what so far, and
+/// what is being worked on right now.
+pub fn status_line(
+    phase: &str,
+    done: usize,
+    total: usize,
     counts: &BTreeMap<String, usize>,
-    events: &[Event],
-    problems: &[String],
-    started: Instant,
-) {
-    if o.json {
-        let report = Report {
-            run_id,
-            dry_run,
-            counts,
-            events,
-            problems,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
-        return;
+    elapsed_secs: u64,
+    current: &[(String, u64)],
+) -> String {
+    let mut line = if total == 0 && done == 0 {
+        phase.to_string()
+    } else {
+        format!("[{done}/{total}] {}", summarize(counts))
+    };
+    line.push_str(&format!(" · {}", util::ago(elapsed_secs as i64)));
+    if !current.is_empty() {
+        let shown: Vec<String> = current
+            .iter()
+            .take(3)
+            .map(|(label, secs)| {
+                let name = label.rsplit_once('/').map(|x| x.1).unwrap_or(label);
+                if *secs >= 10 {
+                    format!("{name} {}", util::ago(*secs as i64))
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect();
+        line.push_str(&format!(" · {}", shown.join(", ")));
+        if current.len() > 3 {
+            line.push_str(&format!(", +{}", current.len() - 3));
+        }
     }
-    for p in problems {
-        eprintln!("problem   {p}");
-    }
-    if !o.quiet {
-        let prefix = if dry_run { "weir (dry run):" } else { "weir:" };
-        println!(
-            "{prefix} {} in {}s",
-            summarize(counts),
-            started.elapsed().as_secs()
-        );
+    line
+}
+
+/// Cuts a line to the terminal's width, so redrawing it never wraps.
+pub fn fit(line: &str) -> String {
+    let width = terminal_size::terminal_size_of(std::io::stderr())
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(100)
+        .max(20);
+    if line.chars().count() < width {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(width - 2).collect();
+        format!("{cut}…")
     }
 }
 
-pub fn lock() -> Result<File> {
+/// Everything a sync shows: event lines, the live status line on a terminal,
+/// streamed JSON, and the log file.
+struct Ui {
+    json: bool,
+    quiet: bool,
+    tty: bool,
+    dry_run: bool,
+    run_id: Option<i64>,
+    started: Instant,
+    phase: String,
+    total: usize,
+    done: usize,
+    counts: BTreeMap<String, usize>,
+    current: Vec<(String, Instant)>,
+    /// Lines describing what went wrong, for the summary and `on_problem`.
+    trouble: Vec<String>,
+    drawn: bool,
+    last_plain: Instant,
+    log: Option<File>,
+}
+
+impl Ui {
+    fn new(o: &Opts, run_id: Option<i64>) -> Ui {
+        Ui {
+            json: o.json,
+            quiet: o.quiet,
+            tty: !o.json && !o.quiet && std::io::stderr().is_terminal(),
+            dry_run: o.dry_run,
+            run_id,
+            started: Instant::now(),
+            phase: "starting".to_string(),
+            total: 0,
+            done: 0,
+            counts: BTreeMap::new(),
+            current: Vec::new(),
+            trouble: Vec::new(),
+            drawn: false,
+            last_plain: Instant::now(),
+            log: if o.dry_run { None } else { open_log() },
+        }
+    }
+
+    fn count(&self, action: &str) -> usize {
+        self.counts.get(action).copied().unwrap_or(0)
+    }
+
+    fn log(&mut self, text: &str) {
+        if let (Some(file), Some(id)) = (&mut self.log, self.run_id) {
+            let _ = writeln!(file, "{}  run {id}  {text}", util::now());
+        }
+    }
+
+    fn begin(&mut self) {
+        if self.json {
+            println!(
+                "{}",
+                json!({ "event": "start", "run_id": self.run_id, "dry_run": self.dry_run })
+            );
+        }
+        self.log("started");
+    }
+
+    fn phase(&mut self, text: String) {
+        self.phase = text;
+        self.draw();
+    }
+
+    fn planned(&mut self, jobs: usize, unchanged: usize) {
+        self.total = jobs;
+        if unchanged > 0 {
+            self.counts.insert("unchanged".to_string(), unchanged);
+        }
+        self.phase = "syncing".to_string();
+        if self.json {
+            println!(
+                "{}",
+                json!({ "event": "plan", "jobs": jobs, "unchanged": unchanged })
+            );
+        }
+        self.draw();
+    }
+
+    fn clear(&mut self) {
+        if self.drawn {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+            self.drawn = false;
+        }
+    }
+
+    fn draw(&mut self) {
+        if !self.tty {
+            return;
+        }
+        let now = Instant::now();
+        let current: Vec<(String, u64)> = self
+            .current
+            .iter()
+            .map(|(label, since)| (label.clone(), (now - *since).as_secs()))
+            .collect();
+        let line = status_line(
+            &self.phase,
+            self.done,
+            self.total,
+            &self.counts,
+            self.started.elapsed().as_secs(),
+            &current,
+        );
+        eprint!("\r\x1b[2K{}", fit(&line));
+        let _ = std::io::stderr().flush();
+        self.drawn = true;
+    }
+
+    /// Called when nothing happened for a moment: keeps the clock moving on a
+    /// terminal, and shows signs of life in a log.
+    fn tick(&mut self) {
+        self.draw();
+        let plain = !self.tty && !self.json && !self.quiet && self.total > 0;
+        if plain && self.last_plain.elapsed() >= Duration::from_secs(30) {
+            println!(
+                "progress  {}/{} after {}",
+                self.done,
+                self.total,
+                util::ago(self.started.elapsed().as_secs() as i64)
+            );
+            self.last_plain = Instant::now();
+        }
+    }
+
+    fn event(&mut self, e: &Event) {
+        *self.counts.entry(e.action.clone()).or_default() += 1;
+        if self.json {
+            let mut value = serde_json::to_value(e).unwrap_or_default();
+            value["event"] = json!("repo");
+            println!("{value}");
+        }
+        if e.action == "unchanged" {
+            return;
+        }
+        let line = describe(e);
+        let problem = e.action == "failed" || e.action == "skipped";
+        if problem {
+            self.trouble.push(line.clone());
+        }
+        self.log(&line);
+        if self.json {
+            return;
+        }
+        self.clear();
+        if problem {
+            eprintln!("{line}");
+        } else if !self.quiet {
+            println!("{line}");
+        }
+        self.draw();
+    }
+
+    fn finish(&mut self, problems: &[String], dry_run: bool) {
+        self.clear();
+        let seconds = self.started.elapsed().as_secs();
+        let summary = summarize(&self.counts);
+        for p in problems {
+            self.log(&format!("problem   {p}"));
+        }
+        self.log(&format!("finished: {summary} in {seconds}s"));
+        if self.json {
+            println!(
+                "{}",
+                json!({
+                    "event": "finish",
+                    "run_id": self.run_id,
+                    "dry_run": dry_run,
+                    "counts": self.counts,
+                    "problems": problems,
+                    "seconds": seconds,
+                    "ok": problems.is_empty() && self.trouble.is_empty(),
+                })
+            );
+            return;
+        }
+        for p in problems {
+            eprintln!("problem   {p}");
+        }
+        if !self.quiet {
+            let prefix = if dry_run { "weir (dry run):" } else { "weir:" };
+            println!("{prefix} {summary} in {seconds}s");
+        }
+    }
+}
+
+/// Opens `~/.weir/weir.log` for appending, starting a new file once it is big.
+fn open_log() -> Option<File> {
+    let path = db::home().join("weir.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5_000_000) {
+        let _ = std::fs::rename(&path, db::home().join("weir.log.1"));
+    }
+    File::options().create(true).append(true).open(path).ok()
+}
+
+fn lock_file() -> Result<File> {
     let path = db::home().join("sync.lock");
-    let file = File::options()
+    File::options()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&path)
-        .with_context(|| format!("could not open {}", path.display()))?;
+        .with_context(|| format!("could not open {}", path.display()))
+}
+
+pub fn lock() -> Result<File> {
+    let file = lock_file()?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => bail!("another weir sync is already running"),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("could not take the sync lock"),
+    }
+}
+
+/// Whether some process holds the sync lock right now.
+pub fn is_running() -> bool {
+    let Ok(file) = lock_file() else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
     }
 }
 
@@ -401,7 +740,12 @@ enum Verdict {
 }
 
 fn verdict(t: &TrackedRow, r: &RemoteRepo) -> Verdict {
-    let by_name = (t.forks || !r.fork)
+    let small_enough = match (t.max_size_mb, r.size_kb) {
+        (Some(max), Some(kb)) => kb / 1024 <= max as u64,
+        _ => true,
+    };
+    let by_name = small_enough
+        && (t.forks || !r.fork)
         && (t.include.is_empty() || matches_any(&t.include, &r.name))
         && !matches_any(&t.exclude, &r.name);
     if !by_name {
@@ -431,10 +775,11 @@ fn event(action: &str, repo: String, repo_id: i64, message: &str) -> Event {
         old_head: None,
         new_head: None,
         message: Some(message.to_string()),
+        millis: None,
     }
 }
 
-fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
+fn plan(conn: &Connection, o: &Opts, root: &Path, ui: &mut Ui) -> Result<Plan> {
     let scope = target::resolve(conn, o.target.as_deref())?;
     let tracked: Vec<TrackedRow> = db::tracked(conn)?
         .into_iter()
@@ -476,6 +821,7 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
         } else {
             format!("{}/{}/{}", p.host, t.owner, t.repo)
         };
+        ui.phase(format!("listing {label}"));
         let prov = match provider::build(p) {
             Ok(prov) => prov,
             Err(e) => {
@@ -758,6 +1104,7 @@ fn plan(conn: &Connection, o: &Opts, root: &Path) -> Result<Plan> {
                 known: synced_before,
                 move_from,
                 accept_origin,
+                size_kb: r.size_kb,
             });
         }
     }
@@ -830,13 +1177,13 @@ fn upsert(
     }
     conn.execute(
         "INSERT INTO repos (provider_id, tracked_id, remote_id, owner, name, default_branch,
-                            clone_url, pushed_at, fork, archived, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                            clone_url, pushed_at, fork, archived, state, size_kb)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT (provider_id, remote_id) DO UPDATE SET
            tracked_id = excluded.tracked_id, owner = excluded.owner, name = excluded.name,
            default_branch = excluded.default_branch, clone_url = excluded.clone_url,
            pushed_at = excluded.pushed_at, fork = excluded.fork, archived = excluded.archived,
-           state = excluded.state",
+           state = excluded.state, size_kb = excluded.size_kb",
         params![
             provider_id,
             tracked_id,
@@ -848,7 +1195,8 @@ fn upsert(
             r.pushed_at,
             r.fork,
             r.archived,
-            state
+            state,
+            r.size_kb.map(|kb| kb as i64)
         ],
     )?;
     let id = conn.query_row(
@@ -866,4 +1214,30 @@ fn upsert(
 /// Used by `status` and `list`: the mirror's location for a repository row.
 pub fn path_of(root: &Path, host: &str, r: &RepoRow) -> PathBuf {
     mirror_path(root, host, &r.owner, &r.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_line_shows_progress_and_what_is_in_flight() {
+        let mut counts = BTreeMap::new();
+        assert_eq!(
+            status_line("listing github.com/acme", 0, 0, &counts, 12, &[]),
+            "listing github.com/acme · 12s"
+        );
+        counts.insert("cloned".to_string(), 3);
+        counts.insert("unchanged".to_string(), 380);
+        let current = vec![
+            ("github.com/acme/big (14.1 GB)".to_string(), 125),
+            ("github.com/acme/web".to_string(), 2),
+            ("github.com/acme/api".to_string(), 1),
+            ("github.com/acme/cli".to_string(), 0),
+        ];
+        assert_eq!(
+            status_line("syncing", 412, 709, &counts, 190, &current),
+            "[412/709] 3 cloned, 380 unchanged · 3m10s · big (14.1 GB) 2m05s, web, api, +1"
+        );
+    }
 }

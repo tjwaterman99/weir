@@ -3,7 +3,11 @@
 Rust CLI (`weir`). One binary, no async. Read `README.md` first for what it does.
 
 - `src/main.rs`: clap definitions and every command except sync.
-- `src/sync.rs`: the sync engine (list providers, diff against the database, run jobs on a thread pool).
+- `src/sync.rs`: the sync engine (list providers, diff against the database, run jobs on a thread
+  pool) and everything a sync shows: the live status line, streamed JSON, the log file.
+- `src/runs.rs`, `src/watch.rs`: reading run history, and `weir watch`. A running sync writes its
+  progress to its `sync_runs` row; other processes read it from there.
+- `src/settings.rs`: the settings (`weir config`). Add a setting there, with a default and help.
 - `src/git.rs`: everything done to a mirror on disk, by running `git`.
 - `src/provider.rs`: the `Provider` trait, GitHub, and the `local` provider (a directory of bare repositories).
 - `src/stray.rs`: finds git repositories under the root that weir does not manage and asks the
@@ -38,6 +42,6 @@ them locally.
   runs the real binary against the `local` provider in a temp directory, with `WEIR_HOME`,
   `HOME` and `GIT_CONFIG_GLOBAL` pointed inside it. The GitHub provider is tested against a small
   HTTP server in the same file.
-- Schema changes: bump `PRAGMA user_version` in `db::open` and migrate; never edit the existing
-  schema in place once a release exists.
+- Schema changes: add an entry to `MIGRATIONS` in `src/db.rs`. Never edit `SCHEMA` or an entry
+  that has shipped.
 - New provider: implement `Provider`, add it to `provider::build`, and test it the way GitHub is.

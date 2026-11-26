@@ -119,6 +119,8 @@ pub struct Job {
     /// The existing clone points at an old name of this repository, as
     /// confirmed with the provider, so its remote may be corrected.
     pub accept_origin: bool,
+    /// Size reported by the provider, shown while a large clone is running.
+    pub size_kb: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

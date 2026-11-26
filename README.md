@@ -160,6 +160,7 @@ weir track github.com/acme                       # everything in the organizatio
 weir track github.com/acme --exclude "*-archive" # skip names matching a glob (repeatable)
 weir track github.com/acme --include "api-*"     # only names matching a glob (repeatable)
 weir track github.com/acme --forks --archived    # forks and archived repositories are skipped by default
+weir track github.com/acme --max-size 2000       # skip repositories larger than 2000 MB
 weir track github.com/acme/api                   # a single repository
 weir untrack github.com/acme                     # stop; the mirrors stay on disk
 ```
@@ -200,6 +201,38 @@ Three promises hold whatever happens:
 `weir sync` exits with `0` when everything is in order, `1` when some repository or account needs
 attention, and `2` when it could not run. `weir sync --dry-run` shows what would happen and
 changes nothing.
+
+### Watching a sync
+
+In a terminal, `weir sync` keeps a status line at the bottom while it works: how many repositories
+are done, the counts so far, the time taken, and what it is working on right now. A large clone
+shows its size, so it does not look stuck.
+
+```
+updated   github.com/acme/api  638bb2c -> df75e0b
+[412/709] 3 cloned, 12 updated, 380 unchanged · 3m10s · monorepo (14.1 GB) 2m05s, web, +2
+```
+
+From any other terminal:
+
+```
+weir status       # says "Sync running: [412/709] ..." while one is in progress
+weir watch        # follows the running sync until it ends, with the same live line
+weir watch --follow   # keeps following the next ones too
+```
+
+That works for a sync started by a scheduler as well. Afterwards:
+
+```
+weir log          # past runs and what each changed
+weir log --slow   # the ten slowest repositories of each run
+weir log --all    # also the repositories that were fetched and had not changed
+```
+
+Every run also appends to `~/.weir/weir.log`, one timestamped line per change.
+
+For scripts, `weir sync --json` prints one JSON object per line as things happen: `start`, `plan`,
+one `repo` per repository worked on, then `finish`.
 
 ### When a repository changes upstream
 
@@ -256,8 +289,20 @@ the network, and a second run started while one is in progress exits straight aw
 30 8 * * *  $HOME/.cargo/bin/weir sync --quiet
 ```
 
-`weir log` shows what each past run changed, and `--json` on `sync`, `status`, `list` and `log`
-gives the same information to a script.
+Nobody watches a scheduled run, so weir makes a bad one hard to miss:
+
+- **`weir status` exits `1` when syncs have stopped succeeding.** It warns when the last successful
+  sync is older than `stale_after_hours` (36 by default) and shows the recent record, for example
+  `Last 7 runs: 6 ok, 1 with problems`. Call it from a shell prompt, a menu bar item or a monitor.
+- **`on_problem` runs a command when a sync ends with problems.** The summary arrives on standard
+  input and in `$WEIR_SUMMARY`; the details are in `$WEIR_PROBLEMS`.
+
+  ```
+  weir config set on_problem 'osascript -e "display notification \"$WEIR_SUMMARY\" with title \"weir\""'
+  ```
+
+`weir config list` shows every setting. `--json` on `status`, `list`, `log` and `doctor` gives the
+same information to a script.
 
 ## Commands
 
@@ -266,7 +311,8 @@ weir auth login <host> [--name NAME] [--env VAR | --command CMD]
 weir auth list
 weir auth logout <name>
 
-weir track <host>/<owner>[/<repo>] [--account NAME] [--include GLOB] [--exclude GLOB] [--forks] [--archived]
+weir track <host>/<owner>[/<repo>] [--account NAME] [--include GLOB] [--exclude GLOB]
+           [--forks] [--archived] [--max-size MB]
 weir untrack <host>/<owner>[/<repo>]
 
 weir sync [<target>] [--dry-run] [--all] [--jobs N] [--network-wait SECONDS]
@@ -276,11 +322,13 @@ weir status [<target>]
 weir doctor
 weir list [<target>] [--archived] [--all]
 weir path <repo>
-weir log [-n COUNT]
+weir watch [--follow]
+weir log [-n COUNT] [--slow] [--all]
 
 weir provider add <kind> <host> [--api-url URL]
 weir provider list
-weir config get|set root <dir>
+weir config list
+weir config get|set|unset <setting> [<value>]
 weir version
 ```
 
@@ -296,6 +344,7 @@ suspect a mirror is behind.
 |---|---|---|
 | Mirrors | `~/Repos/<host>/<owner>/<name>` | `weir config set root <dir>` |
 | Database (accounts, what is tracked, every repository, sync history) | `~/.weir/weir.db` | the `WEIR_HOME` environment variable |
+| Log of every run | `~/.weir/weir.log` | the `WEIR_HOME` environment variable |
 | Tokens | the Keychain, an environment variable or a command | `weir auth login` |
 
 The database is a single SQLite file. Deleting it loses weir's memory, not your mirrors: track the

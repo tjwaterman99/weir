@@ -87,6 +87,25 @@ INSERT INTO providers (kind, host, api_url) VALUES
   ('bitbucket', 'bitbucket.org', 'https://api.bitbucket.org/2.0');
 ";
 
+/// Schema changes after the first release. Entry `i` takes a database from
+/// version `i + 1` to `i + 2`. Never edit an entry that has shipped; add one.
+const MIGRATIONS: [&str; 1] = ["
+ALTER TABLE sync_runs ADD COLUMN phase TEXT;
+ALTER TABLE sync_runs ADD COLUMN pid INTEGER;
+ALTER TABLE sync_runs ADD COLUMN planned INTEGER;
+ALTER TABLE sync_runs ADD COLUMN done INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_runs ADD COLUMN unchanged INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_runs ADD COLUMN current TEXT;
+ALTER TABLE sync_runs ADD COLUMN ok INTEGER;
+ALTER TABLE sync_runs ADD COLUMN listing_seconds INTEGER;
+ALTER TABLE repo_syncs ADD COLUMN millis INTEGER;
+ALTER TABLE tracked ADD COLUMN max_size_mb INTEGER;
+ALTER TABLE repos ADD COLUMN size_kb INTEGER;
+UPDATE sync_runs SET ok = (finished_at IS NOT NULL
+  AND summary NOT LIKE '%\"failed\"%' AND summary NOT LIKE '%\"skipped\"%'
+  AND summary LIKE '%\"problems\":[]%'), phase = 'done';
+"];
+
 /// The directory holding `weir.db` and the sync lock.
 pub fn home() -> PathBuf {
     match std::env::var_os("WEIR_HOME") {
@@ -102,11 +121,38 @@ pub fn open() -> Result<Connection> {
     let path = home.join("weir.db");
     let conn =
         Connection::open(&path).with_context(|| format!("could not open {}", path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    conn.busy_timeout(std::time::Duration::from_secs(60))?;
+    // Write-ahead logging lets `weir status` and the credential helper read
+    // while a sync writes, and makes each small write cheap.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == 0 {
-        conn.execute_batch(&format!("BEGIN; {SCHEMA} PRAGMA user_version = 1; COMMIT;"))?;
+    if version < 1 + MIGRATIONS.len() as i64 {
+        // Take the write lock first, then look again: another weir may have
+        // migrated the database in the meantime.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let migrated = (|| -> Result<()> {
+            let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version == 0 {
+                conn.execute_batch(SCHEMA)?;
+                version = 1;
+            }
+            for (i, migration) in MIGRATIONS.iter().enumerate() {
+                if version < i as i64 + 2 {
+                    conn.execute_batch(migration)?;
+                }
+            }
+            conn.pragma_update(None, "user_version", 1 + MIGRATIONS.len() as i64)?;
+            Ok(())
+        })();
+        match migrated {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.context("could not set up the database"));
+            }
+        }
     }
     Ok(conn)
 }
@@ -126,12 +172,6 @@ pub fn config_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
         params![key, value],
     )?;
     Ok(())
-}
-
-/// Where mirrors are kept. Defaults to `~/Repos`.
-pub fn root(conn: &Connection) -> Result<PathBuf> {
-    let raw = config_get(conn, "root")?.unwrap_or_else(|| "~/Repos".to_string());
-    Ok(util::expand_tilde(&raw))
 }
 
 #[derive(Debug, Clone)]
@@ -220,11 +260,13 @@ pub struct TrackedRow {
     pub exclude: Vec<String>,
     pub forks: bool,
     pub archived: bool,
+    pub max_size_mb: Option<i64>,
 }
 
 pub fn tracked(conn: &Connection) -> Result<Vec<TrackedRow>> {
     let mut st = conn.prepare(
-        "SELECT id, provider_id, account_id, owner, repo, include, exclude, forks, archived
+        "SELECT id, provider_id, account_id, owner, repo, include, exclude, forks, archived,
+                max_size_mb
          FROM tracked ORDER BY provider_id, owner, repo",
     )?;
     let rows = st.query_map([], |r| {
@@ -240,6 +282,7 @@ pub fn tracked(conn: &Connection) -> Result<Vec<TrackedRow>> {
             exclude: serde_json::from_str(&exclude).unwrap_or_default(),
             forks: r.get(7)?,
             archived: r.get(8)?,
+            max_size_mb: r.get(9)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -265,6 +308,7 @@ pub struct RepoRow {
     pub last_message: Option<String>,
     pub disk_owner: Option<String>,
     pub disk_name: Option<String>,
+    pub size_kb: Option<i64>,
 }
 
 /// Repositories matching `filter`, a SQL condition over the `repos` columns.
@@ -276,7 +320,7 @@ pub fn repos(
     let mut st = conn.prepare(&format!(
         "SELECT id, provider_id, tracked_id, remote_id, owner, name, default_branch, clone_url,
                 pushed_at, state, head, synced_pushed_at, synced_branch, last_synced_at,
-                last_result, last_message, disk_owner, disk_name
+                last_result, last_message, disk_owner, disk_name, size_kb
          FROM repos WHERE {filter} ORDER BY provider_id, owner, name"
     ))?;
     let rows = st.query_map(args, |r| {
@@ -299,6 +343,7 @@ pub fn repos(
             last_message: r.get(15)?,
             disk_owner: r.get(16)?,
             disk_name: r.get(17)?,
+            size_kb: r.get(18)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
