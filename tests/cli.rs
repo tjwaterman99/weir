@@ -137,6 +137,18 @@ impl Env {
         self.git(&work, &["push", "-q", "origin", "HEAD:main"]);
     }
 
+    /// Clones an upstream repository to where its mirror would be, the way a
+    /// clone made before weir existed would look.
+    fn clone_into(&self, upstream: &Path, owner: &str, name: &str) -> PathBuf {
+        let dest = self.mirror(owner, name);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        self.git(
+            dest.parent().unwrap(),
+            &["clone", "-q", upstream.to_str().unwrap(), name],
+        );
+        dest
+    }
+
     fn upstream_head(&self, owner: &str, name: &str) -> String {
         self.git(&self.upstream(owner, name), &["rev-parse", "main"])
     }
@@ -513,6 +525,10 @@ fn tracks_single_repositories_and_resolves_names() {
     );
     let scoped = env.ok(&["sync", "local.test/other", "--all"]);
     assert!(scoped.stdout.contains("1 unchanged"), "{}", scoped.stdout);
+    // A repository named after its owner does not make the owner ambiguous.
+    env.make_repo("other", "other");
+    env.ok(&["sync", "other"]);
+    assert_eq!(env.ok(&["list", "other"]).stdout.lines().count(), 2);
 
     // Tracking the whole owner takes over from the single repository.
     assert_eq!(env.weir(&["track", "local.test/other/app"]).code, 2);
@@ -522,13 +538,349 @@ fn tracks_single_repositories_and_resolves_names() {
 
     let untracked = env.ok(&["untrack", "local.test/other"]);
     assert!(
-        untracked.stdout.contains("1 mirror(s) stay on disk"),
+        untracked.stdout.contains("2 mirror(s) stay on disk"),
         "{}",
         untracked.stdout
     );
     assert!(env.mirror("other", "app").exists());
     assert!(!env.ok(&["list"]).stdout.contains("other"));
     assert_eq!(env.weir(&["track", "nowhere.test/acme"]).code, 2);
+}
+
+#[test]
+fn adopts_a_clone_whose_remote_uses_an_old_name() {
+    let env = Env::new();
+    let bare = env.make_repo("acme", "new");
+    std::fs::write(bare.join("weir-old-names"), "acme/old\n").unwrap();
+    let old_url = env.upstream("acme", "old");
+
+    // The directory already has the new name; only its remote is out of date.
+    let m = env.clone_into(&bare, "acme", "new");
+    env.git(
+        &m,
+        &["remote", "set-url", "origin", old_url.to_str().unwrap()],
+    );
+
+    env.ok(&["track", "local.test/acme"]);
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout.contains("adopted   local.test/acme/new"),
+        "{}",
+        run.stdout
+    );
+    assert!(env
+        .git(&m, &["config", "--get", "remote.origin.url"])
+        .ends_with("new.git"));
+    env.assert_mirror("acme", "new");
+}
+
+#[test]
+fn moves_a_clone_left_under_an_old_name_instead_of_cloning() {
+    let env = Env::new();
+    let bare = env.make_repo("acme", "new");
+    std::fs::write(bare.join("weir-old-names"), "acme/old\n").unwrap();
+    let old = env.clone_into(&bare, "acme", "old");
+    env.git(
+        &old,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            env.upstream("acme", "old").to_str().unwrap(),
+        ],
+    );
+    std::fs::write(old.join("untracked.txt"), "keep me\n").unwrap();
+
+    env.ok(&["track", "local.test/acme"]);
+    let run = env.ok(&["sync"]);
+    assert!(!run.stdout.contains("cloned"), "{}", run.stdout);
+    assert!(run.stdout.contains("moved from"), "{}", run.stdout);
+    assert!(!old.exists());
+    // The file that only existed in the old clone proves it was moved, not cloned.
+    let marker = env.mirror("acme", "new").join("untracked.txt");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "keep me\n");
+    std::fs::remove_file(&marker).unwrap();
+    env.assert_mirror("acme", "new");
+}
+
+#[test]
+fn keeps_mirrors_of_archived_repositories() {
+    let env = Env::new();
+    env.make_repo("acme", "app");
+    let lib = env.make_repo("acme", "lib");
+    // Archived before weir ever ran, but a clone of it is already on disk.
+    let relic = env.make_repo("acme", "relic");
+    std::fs::write(relic.join("weir-archived"), "").unwrap();
+    env.clone_into(&relic, "acme", "relic");
+    // Archived and never cloned: it stays that way.
+    let never = env.make_repo("acme", "never");
+    std::fs::write(never.join("weir-archived"), "").unwrap();
+
+    env.ok(&["track", "local.test/acme"]);
+    let first = env.ok(&["sync"]);
+    assert!(
+        first.stdout.contains("adopted   local.test/acme/relic"),
+        "{}",
+        first.stdout
+    );
+    assert!(!env.mirror("acme", "never").exists());
+
+    env.push("acme", "lib", "README.md", "last words\n");
+    std::fs::write(lib.join("weir-archived"), "").unwrap();
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout.contains("archived  local.test/acme/lib"),
+        "{}",
+        run.stdout
+    );
+    // The final push before archiving still lands in the mirror.
+    env.assert_mirror("acme", "lib");
+    assert_eq!(env.ok(&["list"]).stdout.trim(), "local.test/acme/app");
+    let with_archived = env.ok(&["list", "--archived"]).stdout;
+    assert!(
+        with_archived.contains("local.test/acme/lib  (archived)"),
+        "{with_archived}"
+    );
+    assert!(
+        with_archived.contains("local.test/acme/relic  (archived)"),
+        "{with_archived}"
+    );
+    assert_eq!(
+        PathBuf::from(env.ok(&["path", "acme/lib"]).stdout.trim()),
+        env.mirror("acme", "lib")
+    );
+    assert!(env.ok(&["status"]).stdout.contains("(+2 archived)"));
+
+    // Later syncs leave it alone, and prune does not take it unless asked.
+    let quiet = env.ok(&["sync"]);
+    assert!(quiet.stdout.contains("3 unchanged"), "{}", quiet.stdout);
+    assert!(env
+        .ok(&["prune", "--yes"])
+        .stdout
+        .contains("Nothing to prune"));
+    assert!(env.mirror("acme", "lib").exists());
+
+    // Unarchived upstream: it is an ordinary mirror again.
+    std::fs::remove_file(lib.join("weir-archived")).unwrap();
+    env.ok(&["sync"]);
+    assert!(env.ok(&["list"]).stdout.contains("local.test/acme/lib"));
+
+    let pruned = env.ok(&["prune", "--archived", "--yes"]);
+    assert!(
+        pruned.stdout.contains("Deleted 1 mirror"),
+        "{}",
+        pruned.stdout
+    );
+    assert!(!env.mirror("acme", "relic").exists());
+    let after = env.ok(&["sync"]);
+    assert!(!after.stdout.contains("cloned"), "{}", after.stdout);
+}
+
+#[test]
+fn tells_gone_from_inaccessible_from_transferred() {
+    let env = Env::new();
+    let hidden = env.make_repo("acme", "hidden");
+    let moved = env.make_repo("acme", "moved");
+    std::fs::write(moved.join("weir-id"), "77\n").unwrap();
+    let deleted = env.make_repo("acme", "deleted");
+    env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["sync"]);
+
+    std::fs::write(hidden.join("weir-forbidden"), "").unwrap();
+    std::fs::create_dir_all(env.p("up").join("elsewhere")).unwrap();
+    std::fs::rename(&moved, env.upstream("elsewhere", "moved")).unwrap();
+    std::fs::remove_dir_all(&deleted).unwrap();
+
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout.contains("inaccessible local.test/acme/hidden"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("transferred local.test/acme/moved"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("now elsewhere/moved"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("gone      local.test/acme/deleted"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(env.ok(&["list"]).stdout.trim(), "local.test/acme/app");
+
+    // A mirror the account can no longer read is never pruned.
+    let pruned = env.ok(&["prune", "--yes"]);
+    assert!(
+        pruned.stdout.contains("Deleted 2 mirror"),
+        "{}",
+        pruned.stdout
+    );
+    assert!(env.mirror("acme", "hidden").exists());
+    assert!(!env.mirror("acme", "moved").exists());
+    assert!(!env.mirror("acme", "deleted").exists());
+
+    // Access comes back: it is an ordinary mirror again.
+    std::fs::remove_file(hidden.join("weir-forbidden")).unwrap();
+    env.ok(&["sync"]);
+    assert!(env.ok(&["list"]).stdout.contains("local.test/acme/hidden"));
+}
+
+#[test]
+fn follows_a_transfer_to_another_tracked_owner() {
+    let env = Env::new();
+    let bare = env.make_repo("acme", "app");
+    std::fs::write(bare.join("weir-id"), "5\n").unwrap();
+    env.make_repo("zeta", "other");
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["track", "local.test/zeta"]);
+    env.ok(&["sync"]);
+    std::fs::write(env.mirror("acme", "app").join("untracked.txt"), "keep me\n").unwrap();
+
+    std::fs::rename(&bare, env.upstream("zeta", "app")).unwrap();
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout.contains("moved     local.test/zeta/app"),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains("gone"), "{}", run.stdout);
+    assert!(!env.mirror("acme", "app").exists());
+    assert!(env.mirror("zeta", "app").join("untracked.txt").exists());
+}
+
+#[test]
+fn follows_a_repository_that_was_deleted_and_created_again() {
+    let env = Env::new();
+    let bare = env.make_repo("acme", "app");
+    std::fs::write(bare.join("weir-id"), "1\n").unwrap();
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["sync"]);
+
+    std::fs::remove_dir_all(&bare).unwrap();
+    std::fs::remove_dir_all(env.work("acme", "app")).unwrap();
+    env.make_repo("acme", "app");
+    env.push("acme", "app", "fresh.txt", "a different history\n");
+    std::fs::write(bare.join("weir-id"), "2\n").unwrap();
+
+    let run = env.ok(&["sync"]);
+    assert!(
+        run.stdout.contains("recreated local.test/acme/app"),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains("gone"), "{}", run.stdout);
+    env.assert_mirror("acme", "app");
+    assert!(env.mirror("acme", "app").join("fresh.txt").exists());
+    assert_eq!(
+        env.ok(&["list", "--all"]).stdout.trim(),
+        "local.test/acme/app"
+    );
+}
+
+#[test]
+fn follows_a_new_default_branch_and_a_force_push() {
+    let env = Env::new();
+    let bare = env.make_repo("acme", "app");
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["sync"]);
+
+    // The default branch is rewritten, not just extended.
+    let work = env.work("acme", "app");
+    std::fs::write(work.join("README.md"), "rewritten\n").unwrap();
+    env.git(&work, &["commit", "-q", "-a", "--amend", "-m", "rewritten"]);
+    env.git(&work, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    env.ok(&["sync"]);
+    env.assert_mirror("acme", "app");
+
+    // The provider switches the default branch to develop.
+    env.git(&work, &["checkout", "-q", "-b", "develop"]);
+    std::fs::write(work.join("dev.txt"), "on develop\n").unwrap();
+    env.git(&work, &["add", "."]);
+    env.git(&work, &["commit", "-q", "-m", "develop"]);
+    env.git(&work, &["push", "-q", "origin", "develop"]);
+    env.git(&bare, &["symbolic-ref", "HEAD", "refs/heads/develop"]);
+    let run = env.ok(&["sync"]);
+    assert!(run.stdout.contains("updated"), "{}", run.stdout);
+    let m = env.mirror("acme", "app");
+    assert_eq!(
+        env.git(&m, &["rev-parse", "HEAD"]),
+        env.git(&bare, &["rev-parse", "develop"])
+    );
+    assert!(m.join("dev.txt").exists());
+    assert!(env.try_git(&m, &["symbolic-ref", "-q", "HEAD"]).is_none());
+}
+
+#[test]
+fn doctor_explains_unmanaged_clones_and_prune_removes_only_duplicates() {
+    let env = Env::new();
+    let app = env.make_repo("acme", "app");
+    std::fs::write(app.join("weir-old-names"), "acme/app-old\n").unwrap();
+    let vanished = env.make_repo("acme", "vanished");
+    let side = env.make_repo("other", "side");
+    env.ok(&["track", "local.test/acme"]);
+    env.ok(&["sync"]);
+    assert!(env.ok(&["doctor"]).stdout.contains("is managed by weir"));
+
+    // A stale copy of app under its old name.
+    let copy = env.clone_into(&app, "acme", "app-old");
+    env.git(
+        &copy,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            env.upstream("acme", "app-old").to_str().unwrap(),
+        ],
+    );
+    // A repository that only exists here.
+    let mystery = env.mirror("acme", "mystery");
+    std::fs::create_dir_all(&mystery).unwrap();
+    env.git(&mystery, &["init", "-q"]);
+    // A clone of a repository nobody tracks.
+    env.clone_into(&side, "other", "side");
+    // A clone whose repository was deleted upstream and pruned from weir.
+    std::fs::remove_dir_all(&vanished).unwrap();
+    env.ok(&["sync"]);
+    env.ok(&["prune", "--yes"]);
+    std::fs::remove_dir_all(env.work("acme", "vanished")).unwrap();
+    let again = env.make_repo("acme", "vanished");
+    env.clone_into(&again, "acme", "vanished-copy");
+    std::fs::remove_dir_all(&again).unwrap();
+
+    let doctor = env.ok(&["doctor"]).stdout;
+    for expected in [
+        "4 git repositories",
+        "duplicate     ",
+        "a stale copy of local.test/acme/app",
+        "no-remote     ",
+        "untracked     ",
+        "is local.test/other/side, which is not tracked",
+        "gone          ",
+    ] {
+        assert!(
+            doctor.contains(expected),
+            "missing {expected:?} in:\n{doctor}"
+        );
+    }
+    assert!(env
+        .ok(&["status"])
+        .stdout
+        .contains("4 git repositories under the root are not managed"));
+
+    let pruned = env.ok(&["prune", "--unmanaged", "--yes"]);
+    assert!(
+        pruned.stdout.contains("Deleted 1 mirror"),
+        "{}",
+        pruned.stdout
+    );
+    assert!(!copy.exists());
+    assert!(mystery.exists());
+    assert!(env.mirror("other", "side").exists());
+    assert!(env.mirror("acme", "vanished-copy").exists());
+    env.assert_mirror("acme", "app");
 }
 
 #[test]

@@ -116,6 +116,9 @@ pub struct Job {
     pub known: bool,
     /// Where the mirror used to be, when the repository was renamed upstream.
     pub move_from: Option<PathBuf>,
+    /// The existing clone points at an old name of this repository, as
+    /// confirmed with the provider, so its remote may be corrected.
+    pub accept_origin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -215,7 +218,7 @@ fn sync_inner(job: &Job) -> Result<Outcome> {
         bail!("{} has no origin remote", path.display());
     };
     if normalize_url(&origin) != normalize_url(&job.clone_url) {
-        if job.known || moved {
+        if job.known || moved || job.accept_origin {
             out(Some(path), &["remote", "set-url", "origin", &job.clone_url])?;
         } else {
             bail!(

@@ -2,6 +2,7 @@ mod db;
 mod git;
 mod provider;
 mod secret;
+mod stray;
 mod sync;
 mod target;
 mod util;
@@ -87,13 +88,24 @@ enum Cmd {
         /// Do not ask for confirmation
         #[arg(long, short)]
         yes: bool,
+        /// Also delete mirrors of repositories that were archived upstream
+        #[arg(long)]
+        archived: bool,
+        /// Also delete stale copies that weir does not manage (see `weir doctor`)
+        #[arg(long)]
+        unmanaged: bool,
     },
+    /// Explain the git repositories under the root that weir does not manage
+    Doctor,
     /// Show accounts, what is tracked, the last sync and mirrors needing attention
     Status { target: Option<String> },
     /// List mirrored repositories, one per line
     List {
         target: Option<String>,
-        /// Include repositories that are gone, excluded or untracked
+        /// Include mirrors of repositories that were archived upstream
+        #[arg(long)]
+        archived: bool,
+        /// Include every repository weir knows, whatever its state
         #[arg(long)]
         all: bool,
     },
@@ -226,9 +238,19 @@ fn run(cli: Cli) -> Result<i32> {
                 },
             )
         }
-        Cmd::Prune { dry_run, yes } => prune(&conn, dry_run, yes)?,
+        Cmd::Prune {
+            dry_run,
+            yes,
+            archived,
+            unmanaged,
+        } => prune(&conn, dry_run, yes, archived, unmanaged)?,
+        Cmd::Doctor => doctor(&conn, cli.json)?,
         Cmd::Status { target } => status(&conn, target.as_deref(), cli.json)?,
-        Cmd::List { target, all } => list(&conn, target.as_deref(), all, cli.json)?,
+        Cmd::List {
+            target,
+            archived,
+            all,
+        } => list(&conn, target.as_deref(), archived, all, cli.json)?,
         Cmd::Path { repo } => path(&conn, &repo)?,
         Cmd::Log { count } => log(&conn, count, cli.json)?,
         Cmd::Provider(ProviderCmd::Add {
@@ -568,7 +590,20 @@ fn untrack(conn: &Connection, target: &str) -> Result<()> {
 
 // ----------------------------------------------------------------- prune
 
-fn prune(conn: &Connection, dry_run: bool, yes: bool) -> Result<()> {
+/// States whose mirrors `prune` deletes without being asked twice. Archived
+/// mirrors need `--archived`; inaccessible ones are never pruned, because a
+/// temporary loss of access must not cost a mirror.
+const PRUNABLE: [&str; 4] = ["gone", "excluded", "untracked", "transferred"];
+
+fn prune(
+    conn: &Connection,
+    dry_run: bool,
+    yes: bool,
+    archived: bool,
+    unmanaged: bool,
+) -> Result<()> {
+    // Pruning and syncing must not touch the same mirror at once.
+    let _lock = if dry_run { None } else { Some(sync::lock()?) };
     let root = db::root(conn)?;
     let providers = db::providers(conn)?;
     let host_of = |id: i64| {
@@ -578,8 +613,11 @@ fn prune(conn: &Connection, dry_run: bool, yes: bool) -> Result<()> {
             .map(|p| p.host.clone())
             .unwrap_or_default()
     };
-    let active: Vec<String> = db::repos(conn, "state = 'active'", &[])?
+    let wanted = |state: &str| PRUNABLE.contains(&state) || (archived && state == "archived");
+    let all = db::repos(conn, "1 = 1", &[])?;
+    let kept_paths: Vec<String> = all
         .iter()
+        .filter(|r| !wanted(&r.state))
         .map(|r| {
             sync::path_of(&root, &host_of(r.provider_id), r)
                 .to_string_lossy()
@@ -587,8 +625,8 @@ fn prune(conn: &Connection, dry_run: bool, yes: bool) -> Result<()> {
         })
         .collect();
 
-    let mut doomed = Vec::new();
-    for r in db::repos(conn, "state <> 'active'", &[])? {
+    let mut doomed: Vec<(Option<i64>, std::path::PathBuf, String)> = Vec::new();
+    for r in all.iter().filter(|r| wanted(&r.state)) {
         let host = host_of(r.provider_id);
         let dir = sync::mirror_path(
             &root,
@@ -598,20 +636,36 @@ fn prune(conn: &Connection, dry_run: bool, yes: bool) -> Result<()> {
         );
         let label = format!("{host}/{}/{} ({})", r.owner, r.name, r.state);
         if !dir.exists() {
-            // Nothing on disk: just forget the row.
-            if !dry_run {
+            // Nothing on disk: just forget the row, unless the provider still has it.
+            if !dry_run && r.state != "archived" {
                 conn.execute("DELETE FROM repos WHERE id = ?1", [r.id])?;
             }
             continue;
         }
-        if active.contains(&dir.to_string_lossy().to_lowercase()) {
+        if kept_paths.contains(&dir.to_string_lossy().to_lowercase()) {
             continue;
         }
         let blockers = git::blockers(&dir);
         if blockers.is_empty() {
-            doomed.push((r.id, dir, label));
+            doomed.push((Some(r.id), dir, label));
         } else {
             println!("kept      {label}: {}", blockers.join(", "));
+        }
+    }
+    if unmanaged {
+        // Of the clones weir does not manage, only a stale copy of a
+        // repository that is mirrored elsewhere is safe to delete.
+        for report in stray::classify(conn, &root, &stray::scan(conn, &root)?)? {
+            let stray::Kind::Duplicate { repo, .. } = &report.kind else {
+                continue;
+            };
+            let label = format!("{} (stale copy of {repo})", report.stray.label());
+            let blockers = git::blockers(&report.stray.path);
+            if blockers.is_empty() {
+                doomed.push((None, report.stray.path.clone(), label));
+            } else {
+                println!("kept      {label}: {}", blockers.join(", "));
+            }
         }
     }
     if doomed.is_empty() {
@@ -647,9 +701,54 @@ fn prune(conn: &Connection, dry_run: bool, yes: bool) -> Result<()> {
         if let Some(parent) = dir.parent() {
             let _ = std::fs::remove_dir(parent);
         }
-        conn.execute("DELETE FROM repos WHERE id = ?1", [id])?;
+        if let Some(id) = id {
+            conn.execute("DELETE FROM repos WHERE id = ?1", [id])?;
+        }
     }
     println!("Deleted {} mirror(s).", doomed.len());
+    Ok(())
+}
+
+/// Explains every git repository under the root that weir does not manage.
+fn doctor(conn: &Connection, as_json: bool) -> Result<()> {
+    let root = db::root(conn)?;
+    let reports = stray::classify(conn, &root, &stray::scan(conn, &root)?)?;
+    if as_json {
+        let out: Vec<_> = reports
+            .iter()
+            .map(|r| {
+                json!({
+                    "path": r.stray.path,
+                    "kind": r.kind.label(),
+                    "explanation": r.kind.explain(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if reports.is_empty() {
+        println!(
+            "Every git repository under {} is managed by weir.",
+            root.display()
+        );
+        return Ok(());
+    }
+    println!(
+        "{} git repositories under {} are not managed by weir. They are never synced.\n",
+        reports.len(),
+        root.display()
+    );
+    for r in &reports {
+        println!("{:<13} {}", r.kind.label(), r.stray.path.display());
+        println!("{:<13} {}", "", r.kind.explain());
+    }
+    if reports
+        .iter()
+        .any(|r| matches!(r.kind, stray::Kind::Duplicate { .. }))
+    {
+        println!("\n`weir prune --unmanaged` deletes the stale copies (kind: duplicate) that have nothing to lose.");
+    }
     Ok(())
 }
 
@@ -677,10 +776,16 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
     let attention: Vec<&db::RepoRow> = repos
         .iter()
         .filter(|r| {
-            r.state == "active" && matches!(r.last_result.as_deref(), Some("skipped" | "failed"))
+            matches!(r.state.as_str(), "active" | "archived")
+                && matches!(r.last_result.as_deref(), Some("skipped" | "failed"))
         })
         .collect();
-    let leftover = repos.iter().filter(|r| r.state != "active").count();
+    let leftover = repos
+        .iter()
+        .filter(|r| PRUNABLE.contains(&r.state.as_str()))
+        .count();
+    let inaccessible = repos.iter().filter(|r| r.state == "inaccessible").count();
+    let unmanaged = stray::scan(conn, &db::root(conn)?)?.len();
     let last: Option<(String, Option<i64>, Option<String>)> = conn
         .query_row(
             "SELECT started_at, seconds, summary FROM sync_runs ORDER BY id DESC LIMIT 1",
@@ -697,6 +802,10 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
                 .filter(|r| r.tracked_id == Some(t.id) && r.state == "active")
                 .collect();
             let pending = mine.iter().filter(|r| r.last_result.is_none()).count();
+            let archived = repos
+                .iter()
+                .filter(|r| r.tracked_id == Some(t.id) && r.state == "archived")
+                .count();
             let name = if t.repo.is_empty() {
                 format!("{}/{}", host_of(t.provider_id), t.owner)
             } else {
@@ -706,7 +815,7 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
                 .account_id
                 .and_then(|id| accounts.iter().find(|a| a.id == id))
                 .map(|a| a.name.clone());
-            (name, account, mine.len(), pending)
+            (name, account, mine.len(), pending, archived)
         })
         .collect();
 
@@ -716,8 +825,9 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
             "accounts": accounts.iter().map(|a| json!({
                 "name": a.name, "host": host_of(a.provider_id), "login": a.login,
             })).collect::<Vec<_>>(),
-            "tracked": tracked_rows.iter().map(|(name, account, count, pending)| json!({
+            "tracked": tracked_rows.iter().map(|(name, account, count, pending, archived)| json!({
                 "target": name, "account": account, "repos": count, "not_synced": pending,
+                "archived": archived,
             })).collect::<Vec<_>>(),
             "last_sync": last.as_ref().map(|(at, secs, summary)| json!({
                 "started_at": at, "seconds": secs,
@@ -728,6 +838,8 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
                 "result": r.last_result, "message": r.last_message,
             })).collect::<Vec<_>>(),
             "prunable": leftover,
+            "inaccessible": inaccessible,
+            "unmanaged": unmanaged,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
@@ -750,8 +862,11 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
     if tracked_rows.is_empty() {
         println!("  nothing; start with `weir track <host>/<owner>`");
     }
-    for (name, account, count, pending) in &tracked_rows {
+    for (name, account, count, pending, archived) in &tracked_rows {
         let mut line = format!("  {name:<40} {count} repos");
+        if *archived > 0 {
+            line.push_str(&format!(" (+{archived} archived)"));
+        }
         if let Some(a) = account {
             line.push_str(&format!(", account {a}"));
         }
@@ -794,19 +909,36 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<()> 
     }
     if leftover > 0 {
         println!(
-            "\n{leftover} mirror(s) are gone, excluded or untracked; `weir prune` deletes them."
+            "\n{leftover} mirror(s) are gone, excluded, transferred or untracked; `weir prune` deletes them."
+        );
+    }
+    if inaccessible > 0 {
+        println!(
+            "\n{inaccessible} mirror(s) are of repositories this account can no longer read; they are kept (`weir list --all`)."
+        );
+    }
+    if unmanaged > 0 {
+        println!(
+            "\n{unmanaged} git repositories under the root are not managed by weir; `weir doctor` explains them."
         );
     }
     Ok(())
 }
 
-fn list(conn: &Connection, target: Option<&str>, all: bool, as_json: bool) -> Result<()> {
+fn list(
+    conn: &Connection,
+    target: Option<&str>,
+    archived: bool,
+    all: bool,
+    as_json: bool,
+) -> Result<()> {
     let scope = target::resolve(conn, target)?;
     let root = db::root(conn)?;
     let providers = db::providers(conn)?;
     let mut out = Vec::new();
     for r in db::repos(conn, "1 = 1", &[])? {
-        if !scope.matches_repo(&r) || (!all && r.state != "active") {
+        let shown = all || r.state == "active" || (archived && r.state == "archived");
+        if !scope.matches_repo(&r) || !shown {
             continue;
         }
         let host = providers
@@ -825,7 +957,7 @@ fn list(conn: &Connection, target: Option<&str>, all: bool, as_json: bool) -> Re
                 "last_synced_at": r.last_synced_at,
                 "last_result": r.last_result,
             }));
-        } else if all && r.state != "active" {
+        } else if r.state != "active" {
             println!("{name}  ({})", r.state);
         } else {
             println!("{name}");

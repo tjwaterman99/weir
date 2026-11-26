@@ -66,7 +66,31 @@ pub trait Provider {
         login: Option<&str>,
     ) -> Result<Vec<RemoteRepo>>;
 
-    fn get_repo(&self, owner: &str, name: &str, token: Option<&str>) -> Result<Option<RemoteRepo>>;
+    /// What `owner/name` refers to today. Providers redirect the old name of a
+    /// renamed repository, so this also resolves names that are out of date.
+    fn lookup(&self, owner: &str, name: &str, token: Option<&str>) -> Result<Lookup>;
+
+    /// The repository with this provider id, wherever it lives now.
+    fn lookup_id(&self, id: &str, token: Option<&str>) -> Result<Lookup>;
+
+    fn get_repo(&self, owner: &str, name: &str, token: Option<&str>) -> Result<Option<RemoteRepo>> {
+        match self.lookup(owner, name, token)? {
+            Lookup::Found(repo) => Ok(Some(*repo)),
+            Lookup::NotFound => Ok(None),
+            Lookup::Forbidden => bail!("access to {owner}/{name} is forbidden"),
+        }
+    }
+}
+
+/// The answer to "does this repository exist?".
+#[derive(Debug, Clone, PartialEq)]
+pub enum Lookup {
+    Found(Box<RemoteRepo>),
+    /// It does not exist, or the provider will not admit that it does. GitHub
+    /// answers "not found" for a private repository the token cannot see.
+    NotFound,
+    /// It exists, but this token may not read it.
+    Forbidden,
 }
 
 pub fn build(p: &ProviderRow) -> Result<Box<dyn Provider>> {
@@ -132,6 +156,7 @@ struct GhUser {
 enum Fetched {
     Ok(Box<ureq::Response>),
     NotFound,
+    Forbidden,
 }
 
 impl GitHub {
@@ -140,6 +165,9 @@ impl GitHub {
             api: api.trim_end_matches('/').to_string(),
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(30))
+                // A renamed repository answers with a redirect to its id. The
+                // token has to follow it, or a private repository looks gone.
+                .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
                 .build(),
         }
     }
@@ -160,6 +188,13 @@ impl GitHub {
                 Err(AuthError("the token was rejected (HTTP 401)".to_string()).into())
             }
             Err(ureq::Error::Status(404, _)) => Ok(Fetched::NotFound),
+            // 403 also means "rate limited", which says nothing about access.
+            Err(ureq::Error::Status(403 | 451, resp))
+                if resp.header("x-ratelimit-remaining") != Some("0")
+                    && resp.header("retry-after").is_none() =>
+            {
+                Ok(Fetched::Forbidden)
+            }
             Err(ureq::Error::Status(code, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
                 let message = serde_json::from_str::<serde_json::Value>(&body)
@@ -179,6 +214,7 @@ impl GitHub {
             let resp = match self.get(&url, token)? {
                 Fetched::Ok(r) => r,
                 Fetched::NotFound => bail!("not found: {url}"),
+                Fetched::Forbidden => bail!("access to {url} is forbidden"),
             };
             next = resp.header("link").and_then(parse_link_next);
             let page: Vec<GhRepo> = resp
@@ -229,6 +265,7 @@ impl Provider for GitHub {
                 })
             }
             Fetched::NotFound => bail!("not found: {url}"),
+            Fetched::Forbidden => bail!("access to {url} is forbidden"),
         }
     }
 
@@ -242,6 +279,7 @@ impl Provider for GitHub {
         let user: GhUser = match self.get(&url, token)? {
             Fetched::Ok(resp) => resp.into_json().context("unexpected response")?,
             Fetched::NotFound => bail!("no user or organization named {owner}"),
+            Fetched::Forbidden => bail!("access to {owner} is forbidden"),
         };
         let first = if user.kind == "Organization" {
             format!("{}/orgs/{owner}/repos?type=all&per_page=100", self.api)
@@ -254,14 +292,24 @@ impl Provider for GitHub {
         self.pages(first, token)
     }
 
-    fn get_repo(&self, owner: &str, name: &str, token: Option<&str>) -> Result<Option<RemoteRepo>> {
-        let url = format!("{}/repos/{owner}/{name}", self.api);
-        match self.get(&url, token)? {
+    fn lookup(&self, owner: &str, name: &str, token: Option<&str>) -> Result<Lookup> {
+        self.find(&format!("{}/repos/{owner}/{name}", self.api), token)
+    }
+
+    fn lookup_id(&self, id: &str, token: Option<&str>) -> Result<Lookup> {
+        self.find(&format!("{}/repositories/{id}", self.api), token)
+    }
+}
+
+impl GitHub {
+    fn find(&self, url: &str, token: Option<&str>) -> Result<Lookup> {
+        match self.get(url, token)? {
             Fetched::Ok(resp) => {
                 let repo: GhRepo = resp.into_json().context("unexpected response")?;
-                Ok(Some(repo.into()))
+                Ok(Lookup::Found(Box::new(repo.into())))
             }
-            Fetched::NotFound => Ok(None),
+            Fetched::NotFound => Ok(Lookup::NotFound),
+            Fetched::Forbidden => Ok(Lookup::Forbidden),
         }
     }
 }
@@ -272,8 +320,11 @@ impl Provider for GitHub {
 ///
 /// It needs no account and no network, which makes it the provider the test
 /// suite runs against. It also works for repositories kept on a shared disk.
-/// Optional marker files inside a repository: `weir-id` (a stable id, so a
-/// rename is seen as a rename), `weir-archived`, `weir-fork`.
+/// Optional marker files inside a repository let tests imitate a real provider:
+/// `weir-id` (a stable id, so a rename is seen as a rename), `weir-archived`,
+/// `weir-fork`, `weir-old-names` (one `owner/name` per line that redirects
+/// here), `weir-hidden` (exists but is not listed) and `weir-forbidden`
+/// (exists, not listed, and lookups are refused).
 pub struct Local {
     dir: PathBuf,
 }
@@ -325,7 +376,9 @@ impl Provider for Local {
         let mut out = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            if path.is_dir() && path.extension().is_some_and(|e| e == "git") {
+            let listed =
+                !path.join("weir-hidden").exists() && !path.join("weir-forbidden").exists();
+            if listed && path.is_dir() && path.extension().is_some_and(|e| e == "git") {
                 out.push(self.describe(owner, &path)?);
             }
         }
@@ -333,17 +386,56 @@ impl Provider for Local {
         Ok(out)
     }
 
-    fn get_repo(
-        &self,
-        owner: &str,
-        name: &str,
-        _token: Option<&str>,
-    ) -> Result<Option<RemoteRepo>> {
+    fn lookup(&self, owner: &str, name: &str, _token: Option<&str>) -> Result<Lookup> {
         let path = self.dir.join(owner).join(format!("{name}.git"));
         if path.is_dir() {
-            Ok(Some(self.describe(owner, &path)?))
+            return self.answer(owner, &path);
+        }
+        let old = format!("{owner}/{name}");
+        for (current_owner, path) in self.all()? {
+            let names = std::fs::read_to_string(path.join("weir-old-names")).unwrap_or_default();
+            if names.lines().any(|l| l.trim().eq_ignore_ascii_case(&old)) {
+                return self.answer(&current_owner, &path);
+            }
+        }
+        Ok(Lookup::NotFound)
+    }
+
+    fn lookup_id(&self, id: &str, _token: Option<&str>) -> Result<Lookup> {
+        for (owner, path) in self.all()? {
+            if self.describe(&owner, &path)?.id == id {
+                return self.answer(&owner, &path);
+            }
+        }
+        Ok(Lookup::NotFound)
+    }
+}
+
+impl Local {
+    /// Every bare repository under the directory, with its owner.
+    fn all(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut out = Vec::new();
+        for owner in std::fs::read_dir(&self.dir)?.flatten() {
+            let Ok(repos) = std::fs::read_dir(owner.path()) else {
+                continue;
+            };
+            let owner = owner.file_name().to_string_lossy().into_owned();
+            for repo in repos.flatten() {
+                let path = repo.path();
+                if path.is_dir() && path.extension().is_some_and(|e| e == "git") {
+                    out.push((owner.clone(), path));
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn answer(&self, owner: &str, path: &Path) -> Result<Lookup> {
+        if path.join("weir-forbidden").exists() {
+            Ok(Lookup::Forbidden)
         } else {
-            Ok(None)
+            Ok(Lookup::Found(Box::new(self.describe(owner, path)?)))
         }
     }
 }
@@ -361,6 +453,69 @@ mod tests {
             Some("https://api.github.com/orgs/x/repos?page=2")
         );
         assert_eq!(parse_link_next("<https://x/y?page=1>; rel=\"prev\""), None);
+    }
+
+    /// Answers each request with what `route` returns: status, Location, body.
+    fn serve(route: fn(&str, bool) -> (u16, Option<&'static str>, &'static str)) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let root = base.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&raw).to_lowercase();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let authorized = request.contains("authorization: bearer good");
+                let (code, location, body) = route(&path, authorized);
+                let location = location
+                    .map(|l| format!("Location: {root}{l}\r\n"))
+                    .unwrap_or_default();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    const REPO: &str = r#"{"id":7,"name":"new","owner":{"login":"acme"},"default_branch":"main","clone_url":"https://example.test/acme/new.git","pushed_at":"t","fork":false,"archived":false}"#;
+
+    #[test]
+    fn lookup_follows_a_rename_and_keeps_the_token() {
+        let base = serve(|path, authorized| match (path, authorized) {
+            ("/repos/acme/old", true) => (301, Some("/repositories/7"), ""),
+            ("/repositories/7", true) => (200, None, REPO),
+            ("/repos/acme/secret", true) => (403, None, r#"{"message":"SSO required"}"#),
+            _ => (404, None, r#"{"message":"Not Found"}"#),
+        });
+        let gh = GitHub::new(&base);
+        match gh.lookup("acme", "old", Some("good")).unwrap() {
+            Lookup::Found(repo) => assert_eq!((repo.id.as_str(), repo.name.as_str()), ("7", "new")),
+            other => panic!("expected the renamed repository, got {other:?}"),
+        }
+        assert_eq!(
+            gh.lookup_id("7", Some("good")).unwrap(),
+            gh.lookup("acme", "old", Some("good")).unwrap()
+        );
+        assert_eq!(
+            gh.lookup("acme", "nope", Some("good")).unwrap(),
+            Lookup::NotFound
+        );
+        assert_eq!(
+            gh.lookup("acme", "secret", Some("good")).unwrap(),
+            Lookup::Forbidden
+        );
     }
 
     #[test]
