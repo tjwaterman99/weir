@@ -17,7 +17,8 @@ cargo test
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ```
 
-Run all three before pushing; CI runs the same on Linux and macOS.
+Run all three before pushing; CI runs the same on Linux only, so macOS is covered by running
+them locally.
 
 ## Rules
 
