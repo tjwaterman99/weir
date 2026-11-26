@@ -100,7 +100,13 @@ when a mirror needs a token.
    The first run clones everything. Later runs only contact repositories that received a push
    since the last run, so a sync of several hundred repositories usually takes seconds.
 
-4. **Use the mirrors.**
+4. **Keep it current.** Let weir run in the background from now on:
+
+   ```
+   weir service install
+   ```
+
+5. **Use the mirrors.**
 
    ```
    weir list                 # what is mirrored
@@ -191,7 +197,8 @@ recorded last time, and then acts on each repository:
 Three promises hold whatever happens:
 
 - **weir never discards work.** It does not reset, clean or stash. A mirror with modified files is
-  skipped and reported until you deal with it.
+  skipped and reported until you deal with it. (The one forced checkout weir ever does is to finish
+  its own, if it was killed half-way through one. It leaves itself a marker to know.)
 - **Only `weir prune` deletes mirrors.** It deletes mirrors that are gone, excluded, transferred or
   untracked, asks first, and refuses any mirror that has worktrees, local commits, stashes or stray
   files. It never deletes a mirror of a repository you merely lost access to.
@@ -199,7 +206,8 @@ Three promises hold whatever happens:
   reports it and leaves every mirror as it was. A rejected token is reported once per account.
 
 `weir sync` exits with `0` when everything is in order, `1` when some repository or account needs
-attention, and `2` when it could not run. `weir sync --dry-run` shows what would happen and
+attention, and `2` when it could not run. If another sync is running, it waits for it; `--no-wait`
+makes it fail instead. `weir sync --dry-run` shows what would happen and
 changes nothing.
 
 ### Watching a sync
@@ -279,23 +287,72 @@ kept and reported, and so are stashes. A clone that still points at an old name 
 or sits in a directory with the old name, is recognized by asking the provider, then corrected or
 moved into place.
 
-## Running it on a schedule
+## Keeping mirrors current
 
-weir has no daemon. Run `weir sync` from whatever scheduler you have; it waits up to a minute for
-the network, and a second run started while one is in progress exits straight away.
+Run weir as a background service and the mirrors stay a few minutes behind their providers, all
+day, with nothing to schedule:
+
+```
+weir service install
+```
+
+That registers `weir daemon` with launchd (macOS) or systemd (Linux). It starts now, starts again at
+every login, and is restarted if it dies. The daemon runs the same sync as `weir sync`, on a loop:
+
+- **Every five minutes** (`interval_seconds`) it asks each provider what changed and syncs that.
+- **Checking is cheap.** Each listing is a conditional request. When nothing changed, the provider
+  answers "not modified", which does not count against the rate limit, and weir runs no git
+  commands at all.
+- **After sleep or a network drop it catches up at once.** While offline it waits quietly.
+- **It backs off when something is wrong:** longer waits after repeated failures, and until the
+  reset time when a rate limit is nearly used up.
+- **It stops cleanly.** On shutdown it stops the clones and fetches in flight, lets checkouts
+  finish, and exits. An interrupted clone leaves nothing behind, and the next cycle redoes it.
+- **Settings and accounts are re-read every cycle,** so `weir track`, `weir auth login` and
+  `weir config set` take effect without a restart.
+
+```
+weir service status     # is it installed, is it running, when is the next cycle
+weir service stop       # until the next login, or `weir service start`
+weir service uninstall
+weir status             # includes a "Daemon running: ..." line
+weir watch --follow     # watch each cycle as it happens
+```
+
+`weir sync` still works while the daemon runs: it waits for the cycle in progress, then runs.
+Use it after `weir track` if you do not want to wait for the next cycle, or with `--all` to fetch
+everything.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `interval_seconds` | `300` | How often the daemon checks the providers |
+| `daemon_jobs` | `4` | How many repositories it works on at once |
+| `pause_on_battery` | `false` | Wait while the machine runs on its battery |
+
+The daemon's own notes go to `~/.weir/daemon.log`, and every change it makes to `~/.weir/weir.log`.
+
+### Without the service
+
+On a machine where you would rather not run a service, run `weir sync` from a scheduler. It waits
+up to a minute for the network.
 
 ```
 # cron: every morning at 08:30
 30 8 * * *  $HOME/.cargo/bin/weir sync --quiet
 ```
 
-Nobody watches a scheduled run, so weir makes a bad one hard to miss:
+You can also run `weir daemon` under any process supervisor of your own.
+
+### Knowing that it is working
+
+Nobody watches a background sync, so weir makes a bad one hard to miss:
 
 - **`weir status` exits `1` when syncs have stopped succeeding.** It warns when the last successful
   sync is older than `stale_after_hours` (36 by default) and shows the recent record, for example
   `Last 7 runs: 6 ok, 1 with problems`. Call it from a shell prompt, a menu bar item or a monitor.
 - **`on_problem` runs a command when a sync ends with problems.** The summary arrives on standard
-  input and in `$WEIR_SUMMARY`; the details are in `$WEIR_PROBLEMS`.
+  input and in `$WEIR_SUMMARY`; the details are in `$WEIR_PROBLEMS`. The daemon runs it when a
+  problem starts, not on every cycle it lasts.
 
   ```
   weir config set on_problem 'osascript -e "display notification \"$WEIR_SUMMARY\" with title \"weir\""'
@@ -315,7 +372,9 @@ weir track <host>/<owner>[/<repo>] [--account NAME] [--include GLOB] [--exclude 
            [--forks] [--archived] [--max-size MB]
 weir untrack <host>/<owner>[/<repo>]
 
-weir sync [<target>] [--dry-run] [--all] [--jobs N] [--network-wait SECONDS]
+weir sync [<target>] [--dry-run] [--all] [--jobs N] [--network-wait SECONDS] [--no-wait]
+weir daemon [--interval SECONDS]
+weir service install|uninstall|start|stop|status
 weir prune [--dry-run] [--yes] [--archived] [--unmanaged]
 
 weir status [<target>]
@@ -345,6 +404,7 @@ suspect a mirror is behind.
 | Mirrors | `~/Repos/<host>/<owner>/<name>` | `weir config set root <dir>` |
 | Database (accounts, what is tracked, every repository, sync history) | `~/.weir/weir.db` | the `WEIR_HOME` environment variable |
 | Log of every run | `~/.weir/weir.log` | the `WEIR_HOME` environment variable |
+| The daemon's own notes | `~/.weir/daemon.log` | the `WEIR_HOME` environment variable |
 | Tokens | the Keychain, an environment variable or a command | `weir auth login` |
 
 The database is a single SQLite file. Deleting it loses weir's memory, not your mirrors: track the

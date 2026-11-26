@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 fn command(dir: Option<&Path>) -> Command {
     let mut c = Command::new("git");
@@ -42,8 +43,7 @@ fn child_path() -> OsString {
     std::env::join_paths(dirs).unwrap_or_default()
 }
 
-fn run(mut c: Command, what: &str) -> Result<String> {
-    let out = c.output().context("could not run git; is it installed?")?;
+fn finish(out: std::process::Output, what: &str) -> Result<String> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let err: Vec<&str> = err
@@ -55,6 +55,43 @@ fn run(mut c: Command, what: &str) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+fn run(mut c: Command, what: &str) -> Result<String> {
+    let out = c.output().context("could not run git; is it installed?")?;
+    finish(out, what)
+}
+
+/// The git processes that are talking to the network right now. They are the
+/// ones it is safe to stop: an interrupted clone or fetch changes no mirror.
+static NETWORK_CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Runs a clone or a fetch, in a way `abort_network` can stop.
+fn run_network(mut c: Command, what: &str) -> Result<String> {
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = c.spawn().context("could not run git; is it installed?")?;
+    let pid = child.id();
+    NETWORK_CHILDREN.lock().unwrap().push(pid);
+    let out = child.wait_with_output();
+    NETWORK_CHILDREN.lock().unwrap().retain(|p| *p != pid);
+    finish(out.context("could not wait for git")?, what)
+}
+
+/// Stops every clone and fetch in flight, for a clean shutdown. Checkouts are
+/// left to finish: they are quick, and stopping one half-way is what would
+/// leave a mirror in a bad state.
+pub fn abort_network() {
+    for pid in NETWORK_CHILDREN.lock().unwrap().iter() {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+/// Written inside `.git` just before weir moves a mirror's checkout, and
+/// removed right after. If weir dies in between, the next sync finds it and
+/// knows the half-updated files are its own doing, not someone's edits.
+pub const CHECKOUT_MARKER: &str = "weir-checkout";
 
 /// Runs git and returns its standard output. Fails when git does.
 pub fn out(dir: Option<&Path>, args: &[&str]) -> Result<String> {
@@ -236,7 +273,9 @@ fn sync_inner(job: &Job) -> Result<Outcome> {
     if job.fetch {
         let mut args = NETWORK.to_vec();
         args.extend(["fetch", "--quiet", "--prune", "origin"]);
-        out(Some(path), &args)?;
+        let mut c = command(Some(path));
+        c.args(&args);
+        run_network(c, "fetch")?;
     }
 
     let branch = job.default_branch.as_str();
@@ -258,21 +297,44 @@ fn sync_inner(job: &Job) -> Result<Outcome> {
     let _ = out(Some(path), &["remote", "set-head", "origin", branch]);
 
     let in_place = attached.is_none() && old_head.as_deref() == Some(target.as_str());
-    if !in_place {
-        let status = out(
-            Some(path),
-            &["status", "--porcelain", "--untracked-files=no"],
-        )?;
-        if !status.trim().is_empty() {
-            notes.push("has modified files; left as it is".to_string());
-            return Ok(Outcome {
-                action: Action::Skipped,
-                new_head: old_head.clone(),
-                old_head,
-                notes,
-            });
+    let marker = path.join(".git").join(CHECKOUT_MARKER);
+    // A marker means weir itself was killed in the middle of a checkout.
+    let resuming = marker.exists();
+    if !in_place || resuming {
+        if !resuming {
+            let status = out(
+                Some(path),
+                &["status", "--porcelain", "--untracked-files=no"],
+            )?;
+            if !status.trim().is_empty() {
+                notes.push("has modified files; left as it is".to_string());
+                return Ok(Outcome {
+                    action: Action::Skipped,
+                    new_head: old_head.clone(),
+                    old_head,
+                    notes,
+                });
+            }
         }
-        out(Some(path), &["checkout", "--quiet", "--detach", &target])?;
+        std::fs::write(&marker, &target)
+            .with_context(|| format!("could not write {}", marker.display()))?;
+        // Forcing is only ever done to finish weir's own interrupted checkout:
+        // the tree was verified clean before that checkout began.
+        let moved = if resuming {
+            out(
+                Some(path),
+                &["checkout", "--quiet", "--force", "--detach", &target],
+            )
+        } else {
+            out(Some(path), &["checkout", "--quiet", "--detach", &target])
+        };
+        // Git said no on its own (for example, an untracked file is in the
+        // way). That is not an interruption, so nothing is left to finish.
+        let _ = std::fs::remove_file(&marker);
+        moved?;
+        if resuming {
+            notes.push("finished a checkout that was interrupted".to_string());
+        }
         if let Some(b) = &attached {
             notes.push(format!("HEAD was on branch {b}"));
         }
@@ -301,7 +363,7 @@ fn sync_inner(job: &Job) -> Result<Outcome> {
 
     let action = if !job.known {
         Action::Adopted
-    } else if attached.is_some() || (!in_place && !job.fetch) {
+    } else if attached.is_some() || resuming || (!in_place && !job.fetch) {
         Action::Healed
     } else if !in_place {
         Action::Updated
@@ -331,12 +393,39 @@ fn first_time_or(job: &Job, moved: bool, otherwise: Action) -> Action {
     }
 }
 
-fn clone(job: &Job, mut notes: Vec<String>) -> Result<Outcome> {
+/// The name prefix of the temporary directory a repository is cloned into.
+pub const CLONE_PREFIX: &str = ".weir-clone-";
+
+/// Clones into a temporary directory next to the mirror's path and moves it
+/// into place only when it is complete, so an interrupted clone never leaves
+/// something that looks like a mirror.
+fn clone(job: &Job, notes: Vec<String>) -> Result<Outcome> {
     let path = job.path.as_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        bail!("{} is not a usable mirror path", path.display());
+    };
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("could not create {}", parent.display()))?;
+    let prefix = format!("{CLONE_PREFIX}{}-", name.to_string_lossy());
+    // Clear what an interrupted clone of this repository left behind.
+    for entry in std::fs::read_dir(parent)?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
+    let tmp = parent.join(format!("{prefix}{}", std::process::id()));
+    let outcome = clone_into(job, &tmp, notes).and_then(|outcome| {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("could not move the clone to {}", path.display()))?;
+        Ok(outcome)
+    });
+    if outcome.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    outcome
+}
+
+fn clone_into(job: &Job, path: &Path, mut notes: Vec<String>) -> Result<Outcome> {
     let mut c = command(None);
     c.args(NETWORK);
     if let Some(account) = &job.account {
@@ -348,7 +437,7 @@ fn clone(job: &Job, mut notes: Vec<String>) -> Result<Outcome> {
     c.args(["clone", "--quiet", "--no-checkout"])
         .arg(&job.clone_url)
         .arg(path);
-    run(c, "clone")?;
+    run_network(c, "clone")?;
     configure(path, job.account.as_deref())?;
 
     let branch = job.default_branch.as_str();

@@ -4,12 +4,15 @@
 //! repositories does an owner have, and where is one repository cloned from.
 
 use anyhow::{anyhow, bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::db::ProviderRow;
 use crate::git;
+use crate::util;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteRepo {
@@ -56,6 +59,11 @@ pub trait Provider {
         None
     }
 
+    /// What is left of the provider's rate limit, as of the last request.
+    fn rate_limit(&self) -> Option<RateLimit> {
+        None
+    }
+
     fn whoami(&self, token: &str) -> Result<Identity>;
 
     /// Every repository of `owner` that the token can see. `login` is the
@@ -95,9 +103,36 @@ pub enum Lookup {
     Forbidden,
 }
 
+/// Where conditional requests remember what they saw last time. The scope
+/// keeps one account's view of a URL apart from another's.
+pub struct Cache<'a> {
+    pub conn: &'a Connection,
+    pub scope: String,
+}
+
+/// How many requests the provider will still accept, and when that resets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateLimit {
+    pub remaining: u64,
+    /// Seconds since the Unix epoch.
+    pub reset: i64,
+}
+
 pub fn build(p: &ProviderRow) -> Result<Box<dyn Provider>> {
+    build_cached(p, None)
+}
+
+/// Like `build`, with listings fetched conditionally: an unchanged listing is
+/// answered from the cache and does not count against the rate limit.
+pub fn build_cached<'a>(
+    p: &ProviderRow,
+    cache: Option<Cache<'a>>,
+) -> Result<Box<dyn Provider + 'a>> {
     match p.kind.as_str() {
-        "github" => Ok(Box::new(GitHub::new(&p.api_url))),
+        "github" => Ok(Box::new(GitHub {
+            cache,
+            ..GitHub::new(&p.api_url)
+        })),
         "local" => Ok(Box::new(Local {
             dir: PathBuf::from(&p.api_url),
         })),
@@ -107,9 +142,11 @@ pub fn build(p: &ProviderRow) -> Result<Box<dyn Provider>> {
 
 // ---------------------------------------------------------------- GitHub
 
-pub struct GitHub {
+pub struct GitHub<'a> {
     api: String,
     agent: ureq::Agent,
+    cache: Option<Cache<'a>>,
+    limit: Cell<Option<RateLimit>>,
 }
 
 #[derive(Deserialize)]
@@ -157,14 +194,55 @@ struct GhUser {
     kind: String,
 }
 
+/// A response body, and the next page's URL when there is one.
+struct Page {
+    body: String,
+    next: Option<String>,
+}
+
+impl Page {
+    fn parse<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        serde_json::from_str(&self.body).with_context(|| format!("unexpected response from {url}"))
+    }
+}
+
 enum Fetched {
-    Ok(Box<ureq::Response>),
+    Ok(Page),
     NotFound,
     Forbidden,
 }
 
-impl GitHub {
-    pub fn new(api: &str) -> GitHub {
+/// Keeps only the fields weir reads, so a cached listing of a large
+/// organization is kilobytes, not megabytes.
+fn slim(value: &serde_json::Value) -> serde_json::Value {
+    const KEPT: [&str; 12] = [
+        "id",
+        "name",
+        "owner",
+        "login",
+        "type",
+        "default_branch",
+        "clone_url",
+        "pushed_at",
+        "fork",
+        "archived",
+        "size",
+        "message",
+    ];
+    match value {
+        serde_json::Value::Array(items) => items.iter().map(slim).collect(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| KEPT.contains(&key.as_str()))
+            .map(|(key, v)| (key.clone(), slim(v)))
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        other => other.clone(),
+    }
+}
+
+impl GitHub<'_> {
+    pub fn new(api: &str) -> GitHub<'static> {
         GitHub {
             api: api.trim_end_matches('/').to_string(),
             agent: ureq::AgentBuilder::new()
@@ -173,10 +251,63 @@ impl GitHub {
                 // token has to follow it, or a private repository looks gone.
                 .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
                 .build(),
+            cache: None,
+            limit: Cell::new(None),
         }
     }
 
-    fn get(&self, url: &str, token: Option<&str>) -> Result<Fetched> {
+    fn cached(&self, url: &str) -> Result<Option<(String, Page)>> {
+        let Some(cache) = &self.cache else {
+            return Ok(None);
+        };
+        Ok(cache
+            .conn
+            .query_row(
+                "SELECT etag, body, next FROM http_cache WHERE scope = ?1 AND url = ?2",
+                params![cache.scope, url],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        Page {
+                            body: r.get(1)?,
+                            next: r.get(2)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    fn store(&self, url: &str, etag: &str, page: &Page) -> Result<()> {
+        if let Some(cache) = &self.cache {
+            cache.conn.execute(
+                "INSERT INTO http_cache (scope, url, etag, body, next, stored_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (scope, url) DO UPDATE SET
+                   etag = excluded.etag, body = excluded.body, next = excluded.next,
+                   stored_at = excluded.stored_at",
+                params![cache.scope, url, etag, page.body, page.next, util::now()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn note_limit(&self, resp: &ureq::Response) {
+        let number = |name: &str| resp.header(name).and_then(|v| v.parse::<i64>().ok());
+        if let (Some(remaining), Some(reset)) =
+            (number("x-ratelimit-remaining"), number("x-ratelimit-reset"))
+        {
+            self.limit.set(Some(RateLimit {
+                remaining: remaining.max(0) as u64,
+                reset,
+            }));
+        }
+    }
+
+    /// Fetches a URL. With `conditional`, the request carries the ETag of the
+    /// last answer, and "not modified" is served from the cache.
+    fn get(&self, url: &str, token: Option<&str>, conditional: bool) -> Result<Fetched> {
+        let known = if conditional { self.cached(url)? } else { None };
         let mut req = self
             .agent
             .get(url)
@@ -186,20 +317,49 @@ impl GitHub {
         if let Some(t) = token {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
+        if let Some((etag, _)) = &known {
+            req = req.set("If-None-Match", etag);
+        }
         match req.call() {
-            Ok(resp) => Ok(Fetched::Ok(Box::new(resp))),
+            Ok(resp) => {
+                self.note_limit(&resp);
+                if resp.status() == 304 {
+                    return match known {
+                        Some((_, page)) => Ok(Fetched::Ok(page)),
+                        None => {
+                            bail!("{url} answered \"not modified\" to an unconditional request")
+                        }
+                    };
+                }
+                let etag = resp.header("etag").map(String::from);
+                let next = resp.header("link").and_then(parse_link_next);
+                let body = resp
+                    .into_string()
+                    .with_context(|| format!("could not read the response from {url}"))?;
+                let mut page = Page { body, next };
+                if let (true, Some(etag)) = (conditional && self.cache.is_some(), etag) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&page.body) {
+                        page.body = slim(&value).to_string();
+                    }
+                    self.store(url, &etag, &page)?;
+                }
+                Ok(Fetched::Ok(page))
+            }
             Err(ureq::Error::Status(401, _)) => {
                 Err(AuthError("the token was rejected (HTTP 401)".to_string()).into())
             }
             Err(ureq::Error::Status(404, _)) => Ok(Fetched::NotFound),
-            // 403 also means "rate limited", which says nothing about access.
-            Err(ureq::Error::Status(403 | 451, resp))
-                if resp.header("x-ratelimit-remaining") != Some("0")
-                    && resp.header("retry-after").is_none() =>
-            {
-                Ok(Fetched::Forbidden)
-            }
             Err(ureq::Error::Status(code, resp)) => {
+                self.note_limit(&resp);
+                let limited = resp.header("x-ratelimit-remaining") == Some("0")
+                    || resp.header("retry-after").is_some();
+                if matches!(code, 403 | 429) && limited {
+                    bail!("the rate limit of {} is used up for now", self.api);
+                }
+                // Any other 403 is about access to this one thing.
+                if matches!(code, 403 | 451) {
+                    return Ok(Fetched::Forbidden);
+                }
                 let body = resp.into_string().unwrap_or_default();
                 let message = serde_json::from_str::<serde_json::Value>(&body)
                     .ok()
@@ -215,18 +375,27 @@ impl GitHub {
         let mut out = Vec::new();
         let mut next = Some(first);
         while let Some(url) = next {
-            let resp = match self.get(&url, token)? {
-                Fetched::Ok(r) => r,
+            let page = match self.get(&url, token, true)? {
+                Fetched::Ok(page) => page,
                 Fetched::NotFound => bail!("not found: {url}"),
                 Fetched::Forbidden => bail!("access to {url} is forbidden"),
             };
-            next = resp.header("link").and_then(parse_link_next);
-            let page: Vec<GhRepo> = resp
-                .into_json()
-                .with_context(|| format!("unexpected response from {url}"))?;
-            out.extend(page.into_iter().map(RemoteRepo::from));
+            let repos: Vec<GhRepo> = page.parse(&url)?;
+            out.extend(repos.into_iter().map(RemoteRepo::from));
+            next = page.next;
         }
         Ok(out)
+    }
+
+    fn find(&self, url: &str, token: Option<&str>) -> Result<Lookup> {
+        match self.get(url, token, false)? {
+            Fetched::Ok(page) => {
+                let repo: GhRepo = page.parse(url)?;
+                Ok(Lookup::Found(Box::new(repo.into())))
+            }
+            Fetched::NotFound => Ok(Lookup::NotFound),
+            Fetched::Forbidden => Ok(Lookup::Forbidden),
+        }
     }
 }
 
@@ -246,7 +415,7 @@ pub fn parse_link_next(header: &str) -> Option<String> {
     })
 }
 
-impl Provider for GitHub {
+impl Provider for GitHub<'_> {
     fn endpoint(&self) -> Option<String> {
         let (scheme, rest) = self.api.split_once("://")?;
         let authority = rest.split('/').next()?;
@@ -258,11 +427,15 @@ impl Provider for GitHub {
         }
     }
 
+    fn rate_limit(&self) -> Option<RateLimit> {
+        self.limit.get()
+    }
+
     fn whoami(&self, token: &str) -> Result<Identity> {
         let url = format!("{}/user", self.api);
-        match self.get(&url, Some(token))? {
-            Fetched::Ok(resp) => {
-                let user: GhUser = resp.into_json().context("unexpected response from /user")?;
+        match self.get(&url, Some(token), false)? {
+            Fetched::Ok(page) => {
+                let user: GhUser = page.parse(&url)?;
                 Ok(Identity {
                     login: user.login,
                     id: user.id.to_string(),
@@ -280,8 +453,8 @@ impl Provider for GitHub {
         login: Option<&str>,
     ) -> Result<Vec<RemoteRepo>> {
         let url = format!("{}/users/{owner}", self.api);
-        let user: GhUser = match self.get(&url, token)? {
-            Fetched::Ok(resp) => resp.into_json().context("unexpected response")?,
+        let user: GhUser = match self.get(&url, token, true)? {
+            Fetched::Ok(page) => page.parse(&url)?,
             Fetched::NotFound => bail!("no user or organization named {owner}"),
             Fetched::Forbidden => bail!("access to {owner} is forbidden"),
         };
@@ -302,19 +475,6 @@ impl Provider for GitHub {
 
     fn lookup_id(&self, id: &str, token: Option<&str>) -> Result<Lookup> {
         self.find(&format!("{}/repositories/{id}", self.api), token)
-    }
-}
-
-impl GitHub {
-    fn find(&self, url: &str, token: Option<&str>) -> Result<Lookup> {
-        match self.get(url, token)? {
-            Fetched::Ok(resp) => {
-                let repo: GhRepo = resp.into_json().context("unexpected response")?;
-                Ok(Lookup::Found(Box::new(repo.into())))
-            }
-            Fetched::NotFound => Ok(Lookup::NotFound),
-            Fetched::Forbidden => Ok(Lookup::Forbidden),
-        }
     }
 }
 

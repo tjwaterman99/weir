@@ -89,7 +89,8 @@ INSERT INTO providers (kind, host, api_url) VALUES
 
 /// Schema changes after the first release. Entry `i` takes a database from
 /// version `i + 1` to `i + 2`. Never edit an entry that has shipped; add one.
-const MIGRATIONS: [&str; 1] = ["
+const MIGRATIONS: [&str; 2] = [
+    "
 ALTER TABLE sync_runs ADD COLUMN phase TEXT;
 ALTER TABLE sync_runs ADD COLUMN pid INTEGER;
 ALTER TABLE sync_runs ADD COLUMN planned INTEGER;
@@ -104,7 +105,29 @@ ALTER TABLE repos ADD COLUMN size_kb INTEGER;
 UPDATE sync_runs SET ok = (finished_at IS NOT NULL
   AND summary NOT LIKE '%\"failed\"%' AND summary NOT LIKE '%\"skipped\"%'
   AND summary LIKE '%\"problems\":[]%'), phase = 'done';
-"];
+",
+    "
+ALTER TABLE sync_runs ADD COLUMN idle INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE http_cache (
+  scope     TEXT NOT NULL,
+  url       TEXT NOT NULL,
+  etag      TEXT NOT NULL,
+  body      TEXT NOT NULL,
+  next      TEXT,
+  stored_at TEXT NOT NULL,
+  PRIMARY KEY (scope, url)
+);
+CREATE TABLE daemon (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  pid           INTEGER,
+  started_at    TEXT,
+  state         TEXT,
+  last_cycle_at TEXT,
+  next_cycle_at TEXT,
+  message       TEXT
+);
+",
+];
 
 /// The directory holding `weir.db` and the sync lock.
 pub fn home() -> PathBuf {

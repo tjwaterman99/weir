@@ -12,7 +12,7 @@ pub struct Setting {
     pub help: &'static str,
 }
 
-pub const SETTINGS: [Setting; 3] = [
+pub const SETTINGS: [Setting; 6] = [
     Setting {
         key: "root",
         default: "~/Repos",
@@ -27,6 +27,21 @@ pub const SETTINGS: [Setting; 3] = [
         key: "on_problem",
         default: "",
         help: "Shell command to run when a sync ends with problems; it receives the summary on stdin and in $WEIR_SUMMARY",
+    },
+    Setting {
+        key: "interval_seconds",
+        default: "300",
+        help: "How often `weir daemon` checks the providers",
+    },
+    Setting {
+        key: "daemon_jobs",
+        default: "4",
+        help: "How many repositories `weir daemon` works on at once",
+    },
+    Setting {
+        key: "pause_on_battery",
+        default: "false",
+        help: "Whether `weir daemon` waits while the machine runs on its battery (true or false)",
     },
 ];
 
@@ -53,8 +68,14 @@ pub fn set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     find(key)?;
     match key {
         "root" if value.trim().is_empty() => bail!("root cannot be empty"),
-        "stale_after_hours" if value.parse::<u64>().is_err() => {
+        "stale_after_hours" | "interval_seconds" | "daemon_jobs"
+            if value.parse::<u64>().is_err() =>
+        {
             bail!("{key} must be a whole number")
+        }
+        "interval_seconds" | "daemon_jobs" if value == "0" => bail!("{key} must be at least 1"),
+        "pause_on_battery" if !matches!(value, "true" | "false") => {
+            bail!("{key} must be true or false")
         }
         _ => {}
     }

@@ -1,8 +1,10 @@
+mod daemon;
 mod db;
 mod git;
 mod provider;
 mod runs;
 mod secret;
+mod service;
 mod settings;
 mod stray;
 mod sync;
@@ -85,6 +87,9 @@ enum Cmd {
         /// Seconds to wait for the provider to become reachable
         #[arg(long, default_value_t = 60)]
         network_wait: u64,
+        /// Fail at once if another sync is running, instead of waiting for it
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Delete mirrors that are no longer tracked or are gone from the provider
     Prune {
@@ -138,6 +143,18 @@ enum Cmd {
         #[arg(long)]
         follow: bool,
     },
+    /// Keep every mirror current: sync, wait, repeat, until stopped
+    Daemon {
+        /// Seconds between cycles (default: the `interval_seconds` setting)
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Stop after this many cycles
+        #[arg(long, hide = true)]
+        cycles: Option<u64>,
+    },
+    /// Run the daemon as a service that starts at login
+    #[command(subcommand)]
+    Service(ServiceCmd),
     /// Manage provider hosts (only needed for self-hosted providers)
     #[command(subcommand)]
     Provider(ProviderCmd),
@@ -190,6 +207,20 @@ enum ProviderCmd {
     },
     /// List provider hosts
     List,
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Register the daemon with launchd (macOS) or systemd (Linux) and start it
+    Install,
+    /// Stop the daemon and remove the service
+    Uninstall,
+    /// Start the daemon now
+    Start,
+    /// Stop the daemon until the next login
+    Stop,
+    /// Say whether the service is installed and the daemon is running
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -249,6 +280,7 @@ fn run(cli: Cli) -> Result<i32> {
             all,
             jobs,
             network_wait,
+            no_wait,
         } => {
             return sync::run(
                 &conn,
@@ -260,6 +292,9 @@ fn run(cli: Cli) -> Result<i32> {
                     network_wait,
                     json: cli.json,
                     quiet: cli.quiet,
+                    wait: !no_wait,
+                    daemon: false,
+                    stop: None,
                 },
             )
         }
@@ -289,6 +324,14 @@ fn run(cli: Cli) -> Result<i32> {
                 println!("{:<10} {:<24} {}", p.kind, p.host, p.api_url);
             }
         }
+        Cmd::Daemon { interval, cycles } => {
+            return daemon::run(&conn, &daemon::Opts { interval, cycles })
+        }
+        Cmd::Service(ServiceCmd::Install) => service::install()?,
+        Cmd::Service(ServiceCmd::Uninstall) => service::uninstall()?,
+        Cmd::Service(ServiceCmd::Start) => service::start()?,
+        Cmd::Service(ServiceCmd::Stop) => service::stop()?,
+        Cmd::Service(ServiceCmd::Status) => return service::status(&conn),
         Cmd::Config(ConfigCmd::List) => config_list(&conn, cli.json)?,
         Cmd::Config(ConfigCmd::Get { key }) => config_get(&conn, &key)?,
         Cmd::Config(ConfigCmd::Set { key, value }) => config_set(&conn, &key, &value)?,
@@ -640,7 +683,11 @@ fn prune(
     unmanaged: bool,
 ) -> Result<()> {
     // Pruning and syncing must not touch the same mirror at once.
-    let _lock = if dry_run { None } else { Some(sync::lock()?) };
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(sync::lock(true)?)
+    };
     let root = settings::root(conn)?;
     let providers = db::providers(conn)?;
     let host_of = |id: i64| {
@@ -938,6 +985,7 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<i32>
                 "seconds": run.seconds, "result": run.verdict(), "counts": run.counts(),
                 "problems": run.problems(),
             })),
+            "daemon": { "running": daemon::is_running(), "status": daemon::describe(conn)? },
             "health": {
                 "last_ok_at": health.last_ok_at, "stale": health.stale_hours.is_some(),
                 "stale_after_hours": health.limit_hours,
@@ -990,6 +1038,13 @@ fn status(conn: &Connection, target: Option<&str>, as_json: bool) -> Result<i32>
     }
 
     println!();
+    if let Some(line) = daemon::describe(conn)? {
+        println!("{line}");
+    } else if service::definition_path().exists() {
+        println!(
+            "Daemon not running, though its service is installed; `weir service start` starts it."
+        );
+    }
     if let Some(run) = &running {
         println!("Sync running: {}", watch::progress(conn, run)?);
     }
