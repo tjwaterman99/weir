@@ -170,3 +170,7 @@ Releases: bump `version` in `Cargo.toml`, merge, then push a tag `vX.Y.Z`. The r
 tests and builds for macOS and Linux (Apple silicon, Intel and ARM), publishes a GitHub release and
 updates the Homebrew tap. A tag with a suffix, such as `v1.2.0-rc.1`, publishes a pre-release and
 leaves the tap alone.
+
+## License
+
+[MIT](LICENSE): free to use, change and redistribute.
