@@ -22,6 +22,7 @@ class Weir < Formula
   desc "Keeps local, read-only mirrors of your repositories up to date"
   homepage "https://github.com/tjwaterman99/weir"
   version "$version"
+  license "MIT"
 
   on_macos do
     on_arm do

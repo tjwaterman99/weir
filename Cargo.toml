@@ -4,6 +4,7 @@ version = "0.2.1"
 edition = "2021"
 rust-version = "1.89"
 description = "Keeps a set of repositories from a provider mirrored locally, read-only"
+license = "MIT"
 publish = false
 build = "build.rs"
 
