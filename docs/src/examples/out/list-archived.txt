@@ -1,4 +1,0 @@
-$ weir list --archived
-git.example.com/acme/api
-git.example.com/acme/cli
-git.example.com/acme/web  (archived)

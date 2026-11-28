@@ -2,7 +2,6 @@ mod daemon;
 mod db;
 mod git;
 mod provider;
-mod reference;
 mod runs;
 mod secret;
 mod service;
@@ -164,15 +163,6 @@ enum Cmd {
     Config(ConfigCmd),
     /// Print the version
     Version,
-    /// Write the documentation site's command reference
-    #[command(hide = true)]
-    Reference {
-        /// Directory to write the pages into
-        dir: std::path::PathBuf,
-        /// Directory of hand-written example files, one per command
-        #[arg(long)]
-        examples: std::path::PathBuf,
-    },
     /// The git credential helper weir installs in each mirror
     #[command(hide = true)]
     Credential {
@@ -266,11 +256,6 @@ fn run(cli: Cli) -> Result<i32> {
         );
         return Ok(0);
     }
-    if let Cmd::Reference { dir, examples } = &cli.cmd {
-        use clap::CommandFactory;
-        reference::write(Cli::command(), dir, examples)?;
-        return Ok(0);
-    }
     let conn = db::open()?;
     match cli.cmd {
         Cmd::Auth(AuthCmd::Login {
@@ -359,7 +344,7 @@ fn run(cli: Cli) -> Result<i32> {
             println!("{key} is back to its default.");
         }
         Cmd::Credential { account, operation } => credential(&conn, &account, operation)?,
-        Cmd::Version | Cmd::Reference { .. } => unreachable!(),
+        Cmd::Version => unreachable!(),
     }
     Ok(0)
 }
