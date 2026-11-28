@@ -1,2 +1,0 @@
-$ weir track git.example.com/acme
-Tracking git.example.com/acme. Run `weir sync` to mirror it.

@@ -20,8 +20,6 @@ $ brew services start weir    # from now on, mirrors stay a few minutes behind
 $ rg "retry_policy" ~/Repos/github.com/acme
 ```
 
-**Documentation: <https://tjwaterman99.github.io/weir/>**
-
 ## Why it exists
 
 **Local copies are much faster to search than a provider's API.** A coding agent, or a person,
@@ -53,9 +51,9 @@ brew services start weir
 ```
 
 The first command installs a prebuilt binary; the second keeps your mirrors current in the
-background. weir needs `git` on your `PATH`. The
-[install page](https://tjwaterman99.github.io/weir/install.html) covers release archives and
-building from source.
+background. weir needs `git` on your `PATH`. Without Homebrew, download an archive from the
+[releases page](https://github.com/tjwaterman99/weir/releases), or build from source with
+`cargo install --path .`.
 
 ## Quick start
 
@@ -103,24 +101,17 @@ building from source.
 
 - **Mirrors that are never on a branch.** Each one sits on a detached HEAD at the tip of the
   remote's default branch, with read-only files. Updating one is a fetch, never a merge.
-  [Mirrors](https://tjwaterman99.github.io/weir/concepts/mirrors.html)
 - **Several accounts per host.** Each owner goes through one account, and each mirror's git config
   names it, so fetches and pushes sign in as the right user.
-  [Accounts](https://tjwaterman99.github.io/weir/concepts/accounts.html)
 - **Changes go through worktrees.** A worktree off a mirror is a writable checkout on its own
   branch that shares the mirror's history.
-  [Worktrees](https://tjwaterman99.github.io/weir/guides/worktrees.html)
 - **A background daemon.** Every few minutes it asks what changed, at no cost when nothing did.
-  [Background](https://tjwaterman99.github.io/weir/guides/background.html)
 - **It follows what happens upstream.** Renames, transfers, archiving, deletion and lost access
   each have a defined outcome.
-  [Upstream changes](https://tjwaterman99.github.io/weir/concepts/upstream-changes.html)
 - **It never discards work.** No reset, no clean, no stash. A mirror someone edited is skipped and
   reported, and only `weir prune` deletes anything, after asking.
-  [What a sync does](https://tjwaterman99.github.io/weir/concepts/sync.html)
 - **It tells you when it is not working.** A live view of a running sync, a history of past runs,
   and a status that fails when syncs stop succeeding.
-  [Monitoring](https://tjwaterman99.github.io/weir/guides/monitoring.html)
 
 ## Commands
 
@@ -135,9 +126,7 @@ weir doctor / prune                find and delete what is no longer needed
 weir provider / config / version   setup
 ```
 
-Each one has a page in the
-[command reference](https://tjwaterman99.github.io/weir/reference/commands/index.html), and
-`weir <command> --help` prints the same text.
+`weir <command> --help` describes each one.
 
 ## Providers
 
@@ -154,17 +143,6 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 The end-to-end tests run the real binary against throwaway repositories in a temp directory. They
 use no network and never touch your own mirrors, database or git config. See `AGENTS.md` for the
 layout of the code and the rules a change has to keep.
-
-The documentation site is built from `docs/` with [mdBook](https://rust-lang.github.io/mdBook/):
-
-```
-mdbook serve docs                                        # preview at http://localhost:3000
-cargo run -- reference docs/src/reference/commands --examples docs/src/examples
-docs/capture-examples.sh                                 # refresh the example output
-```
-
-The command reference is generated from the command-line definitions; a test fails when it is out
-of date.
 
 Releases: bump `version` in `Cargo.toml`, merge, then push a tag `vX.Y.Z`. The release workflow
 tests and builds for macOS and Linux (Apple silicon, Intel and ARM), publishes a GitHub release and

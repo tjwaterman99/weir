@@ -1,2 +1,0 @@
-$ weir prune --dry-run
-would delete  git.example.com/acme/docs (gone)  /Users/me/Repos/git.example.com/acme/docs

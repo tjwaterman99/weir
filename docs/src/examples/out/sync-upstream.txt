@@ -1,5 +1,0 @@
-$ weir sync
-archived  git.example.com/acme/web  (archived on the provider; mirror kept)
-gone      git.example.com/acme/docs  (no longer on the provider; mirror kept)
-cloned    git.example.com/acme/cli
-weir: 1 cloned, 1 archived, 1 gone, 2 unchanged in 2s

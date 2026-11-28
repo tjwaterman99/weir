@@ -1,5 +1,0 @@
-$ weir sync --dry-run
-archived  git.example.com/acme/web  (archived on the provider; mirror kept)
-gone      git.example.com/acme/docs  (no longer on the provider; mirror kept)
-clone     git.example.com/acme/cli
-weir (dry run): 1 clone, 1 archived, 1 gone, 2 unchanged in 2s
